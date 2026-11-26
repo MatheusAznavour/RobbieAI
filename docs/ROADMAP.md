@@ -37,13 +37,15 @@
 
 ---
 
-## Milestone 3 — Human-in-the-Loop Safety & Desktop Control UX
+## Milestone 3 — Conversational Desktop AI Interface & Human-in-the-Loop *(Completed)*
 
-**Goal:** Deliver an interactive, safe Windows desktop experience for running and supervising agent tasks.
+**Goal:** Deliver a polished conversational Windows desktop experience uniting natural chat, supervised Agent-S desktop execution, human approvals, and persistent emergency-stop controls.
 
-- Build the Robbie desktop UI: task composer, live step/reasoning timeline, screenshot previews, and status indicators.
-- Implement action approval workflow (Approve / Deny / Policy tiers) over WebSockets.
-- Add a global emergency-stop shortcut (`globalShortcut`) and non-intrusive window minimize/overlay handling during screen capture.
+- [x] Implement backend conversational orchestration (`ConversationOrchestrator`), bounded atomic local persistence (`ConversationStore`), and provider/model settings (`ProviderSettingsManager`) without exposing secrets to Electron or the Renderer.
+- [x] Extend the Electron Main/Preload typed `window.robbie` bridge with conversation, task, approval, emergency-stop, settings, WebSocket auto-reconnection, and global Emergency Stop shortcut (`Ctrl+Alt+Esc`).
+- [x] Build the ChatGPT-inspired dark desktop UI: sidebar with searchable/renameable/deletable conversation history, safe zero-HTML Markdown renderer, multiline composer with `Auto`/`Chat`/`Desktop` modes and draft preservation, inline task execution cards, inline & dedicated Human Approval Center, Tasks monitor, and Settings screen.
+- [x] Verify end-to-end security invariants, automated backend/frontend tests, and live Electron `sandbox: true` execution.
+- *(Deferred to M3.7 / Milestone 4)*: Safe file/image attachment ingestion, OS-encrypted credential vault (`safeStorage`), and SQLite trajectory/audit database migration.
 
 ---
 

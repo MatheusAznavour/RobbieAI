@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from robbie.providers.config import AgentRuntimeConfig
+from robbie.providers.settings import ModelSelectionState
 
 
 class HealthResponse(BaseModel):
@@ -20,6 +21,7 @@ class HealthResponse(BaseModel):
     pid: int
     uptime_seconds: float = Field(ge=0.0)
     websocket_connections: int = Field(ge=0)
+    emergency_stopped: bool = False
     timestamp: str
 
 
@@ -33,6 +35,7 @@ class StatusEvent(BaseModel):
     port: int
     pid: int
     uptime_seconds: float = Field(ge=0.0)
+    emergency_stopped: bool = False
     timestamp: str
 
 
@@ -60,6 +63,7 @@ class CreateTaskRequest(BaseModel):
 
     instruction: str = Field(min_length=1, max_length=4000)
     config: AgentRuntimeConfig
+    conversation_id: str | None = Field(default=None, max_length=128)
 
     @field_validator("instruction")
     @classmethod
@@ -95,6 +99,7 @@ class PendingApprovalResponse(BaseModel):
 
 class TaskStatusResponse(BaseModel):
     task_id: str
+    conversation_id: str | None = None
     instruction: str
     state: str
     current_step: int
@@ -104,6 +109,7 @@ class TaskStatusResponse(BaseModel):
     created_at: str
     updated_at: str
     pending_approval: PendingApprovalResponse | None = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class EmergencyStopResponse(BaseModel):
@@ -116,3 +122,92 @@ class EmergencyStopResetResponse(BaseModel):
     status: Literal["ready"] = "ready"
     emergency_stopped: Literal[False] = False
     timestamp: str
+
+
+class CreateConversationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str | None = Field(default=None, max_length=64)
+
+
+class RenameConversationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=64)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Conversation title must not be empty.")
+        return cleaned
+
+
+class SendMessageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1, max_length=8000)
+    mode: Literal["auto", "chat", "desktop"] = "auto"
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("Message content must not be empty.")
+        return cleaned
+
+
+class ChatMessageResponse(BaseModel):
+    message_id: str
+    conversation_id: str
+    role: Literal["user", "assistant"]
+    content: str
+    kind: Literal["chat", "task_started", "task_summary", "error"]
+    task_id: str | None = None
+    created_at: str
+
+
+class ConversationSummaryResponse(BaseModel):
+    conversation_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    message_count: int
+    task_count: int
+    last_message_preview: str
+
+
+class ConversationDetailResponse(BaseModel):
+    conversation_id: str
+    title: str
+    created_at: str
+    updated_at: str
+    messages: list[ChatMessageResponse]
+    task_ids: list[str]
+    tasks: list[TaskStatusResponse] = Field(default_factory=list)
+
+
+class SendMessageResponse(BaseModel):
+    conversation: ConversationSummaryResponse
+    user_message: ChatMessageResponse
+    assistant_message: ChatMessageResponse
+    task: TaskStatusResponse | None = None
+
+
+class SettingsSnapshotResponse(BaseModel):
+    selection: ModelSelectionState
+    providers: list[dict[str, Any]]
+    chat_ready: bool
+    chat_configuration_errors: list[str]
+    desktop_ready: bool
+    desktop_configuration_errors: list[str]
+    safety_policy_locked: bool
+    requires_restart_on_env_change: bool
+
+
+class UpdateSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selection: ModelSelectionState

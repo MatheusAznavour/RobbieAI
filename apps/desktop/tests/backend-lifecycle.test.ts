@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -73,7 +75,7 @@ test('resolveBackendLaunchConfig distinguishes development vs packaged paths', (
   )
 })
 
-test('BackendSidecarManager starts, authenticates, communicates over WS, restarts, and stops cleanly', async () => {
+test('BackendSidecarManager handles auth, conversations, settings, emergency stop latch, restart, and cleanup', async () => {
   const states: BackendStatusSnapshot[] = []
   const events: BackendEvent[] = []
   const silentLogger = {
@@ -81,6 +83,12 @@ test('BackendSidecarManager starts, authenticates, communicates over WS, restart
     warn: () => undefined,
     error: () => undefined,
   }
+
+  const tempDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'robbie-m3-test-'))
+  const prevDataDir = process.env.ROBBIE_DATA_DIR
+  const prevFakeKey = process.env.OPENAI_API_KEY
+  process.env.ROBBIE_DATA_DIR = tempDataDir
+  process.env.OPENAI_API_KEY = 'sk-test-never-expose-to-renderer-999999'
 
   const manager = new BackendSidecarManager({
     isPackaged: false,
@@ -100,12 +108,15 @@ test('BackendSidecarManager starts, authenticates, communicates over WS, restart
     assert.ok(started.port !== null && started.port > 0)
     assert.ok(started.pid !== null && started.pid > 0)
     assert.equal(started.wsConnected, true)
+    assert.equal(started.emergencyStopped, false)
     assert.equal('apiToken' in started, false)
     assert.equal('token' in started, false)
 
     // Unauthenticated HTTP request must fail with 401
     const unauthResp = await fetch(`http://127.0.0.1:${started.port}/health`)
     assert.equal(unauthResp.status, 401)
+    const unauthConv = await fetch(`http://127.0.0.1:${started.port}/conversations`)
+    assert.equal(unauthConv.status, 401)
 
     // Untrusted WebSocket origin must be rejected
     const badOriginWs = new LoopbackWebSocketClient({
@@ -122,12 +133,47 @@ test('BackendSidecarManager starts, authenticates, communicates over WS, restart
     assert.equal(health.status, 'ok')
     assert.equal(health.port, started.port)
     assert.equal(health.websocket_connections, 1)
+    assert.equal(health.emergency_stopped, false)
 
     // Authenticated WebSocket ping/pong
     const pong = await manager.ping()
     assert.equal(pong.type, 'pong')
     assert.ok(typeof pong.request_id === 'string' && pong.request_id.length > 0)
     assert.ok(events.some((e) => e.type === 'pong'))
+
+    // Conversation CRUD persists across calls
+    const created = await manager.createConversation('Milestone 3 Integration')
+    assert.equal(created.title, 'Milestone 3 Integration')
+    const listed = await manager.listConversations('Milestone')
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0].conversation_id, created.conversation_id)
+    const renamed = await manager.renameConversation(created.conversation_id, 'Renamed Chat')
+    assert.equal(renamed.title, 'Renamed Chat')
+
+    // Settings never leak API keys to Electron Main / Renderer
+    const settings = await manager.getSettings()
+    assert.equal(settings.safety_policy_locked, true)
+    const serializedSettings = JSON.stringify(settings)
+    assert.equal(
+      serializedSettings.includes('sk-test-never-expose-to-renderer-999999'),
+      false,
+    )
+
+    // Emergency Stop latches persistently until explicit reset
+    const stopped = await manager.emergencyStop()
+    assert.equal(stopped.status, 'emergency_stopped')
+    assert.equal(manager.getSnapshot().emergencyStopped, true)
+    const healthWhileStopped = await manager.checkHealth()
+    assert.equal(healthWhileStopped.emergency_stopped, true)
+
+    const reset = await manager.resetEmergencyStop()
+    assert.equal(reset.emergency_stopped, false)
+    assert.equal(manager.getSnapshot().emergencyStopped, false)
+
+    // Delete conversation
+    await manager.deleteConversation(created.conversation_id)
+    const afterDelete = await manager.listConversations()
+    assert.equal(afterDelete.length, 0)
 
     // Restart spawns a fresh sidecar and terminates the previous process
     const firstPid = started.pid
@@ -146,6 +192,17 @@ test('BackendSidecarManager starts, authenticates, communicates over WS, restart
     assert.ok(states.some((s) => s.state === 'stopped'))
   } finally {
     await manager.stop()
+    if (prevDataDir === undefined) {
+      delete process.env.ROBBIE_DATA_DIR
+    } else {
+      process.env.ROBBIE_DATA_DIR = prevDataDir
+    }
+    if (prevFakeKey === undefined) {
+      delete process.env.OPENAI_API_KEY
+    } else {
+      process.env.OPENAI_API_KEY = prevFakeKey
+    }
+    fs.rmSync(tempDataDir, { recursive: true, force: true })
   }
 })
 

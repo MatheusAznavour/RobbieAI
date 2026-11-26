@@ -148,6 +148,7 @@ class PendingApproval:
 class TaskRecord:
     task_id: str
     instruction: str
+    conversation_id: str | None = None
     state: TaskState = "pending"
     current_step: int = 0
     max_steps: int = 15
@@ -156,6 +157,7 @@ class TaskRecord:
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
     pending_approval: PendingApproval | None = None
+    recent_events: list[dict[str, Any]] = field(default_factory=list)
     resolved_approval_ids: set[str] = field(default_factory=set, repr=False)
     resume_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -166,9 +168,15 @@ class TaskRecord:
     def __post_init__(self) -> None:
         self.resume_event.set()
 
+    def record_event(self, payload: dict[str, Any]) -> None:
+        self.recent_events.append(payload)
+        if len(self.recent_events) > 40:
+            self.recent_events = self.recent_events[-40:]
+
     def to_public_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
+            "conversation_id": self.conversation_id,
             "instruction": self.instruction,
             "state": self.state,
             "current_step": self.current_step,
@@ -180,6 +188,7 @@ class TaskRecord:
             "pending_approval": (
                 self.pending_approval.to_public_dict() if self.pending_approval else None
             ),
+            "events": list(self.recent_events),
         }
 
 
@@ -202,6 +211,7 @@ class TaskRunner:
         adapter_factory: Callable[[AgentRuntimeConfig], StepPredictorProtocol] | None = None,
         dispatcher_factory: Callable[[AgentRuntimeConfig], ActionDispatcherProtocol] | None = None,
         screen_capture_factory: Callable[[], ScreenCaptureProtocol] | None = None,
+        on_task_finished: Callable[[TaskRecord], Awaitable[None]] | None = None,
         max_retained_tasks: int = DEFAULT_MAX_RETAINED_TASKS,
     ) -> None:
         self._broadcaster = broadcaster
@@ -212,9 +222,16 @@ class TaskRunner:
             lambda cfg: WindowsActionDispatcher(dry_run=cfg.dry_run)
         )
         self._screen_capture_factory = screen_capture_factory or (lambda: WindowsScreenCapture())
+        self._on_task_finished = on_task_finished
         self._max_retained_tasks = max(1, max_retained_tasks)
         self._tasks: dict[str, TaskRecord] = {}
         self._emergency_stopped = False
+
+    def set_on_task_finished(
+        self,
+        callback: Callable[[TaskRecord], Awaitable[None]] | None,
+    ) -> None:
+        self._on_task_finished = callback
 
     @property
     def is_emergency_stopped(self) -> bool:
@@ -247,6 +264,8 @@ class TaskRunner:
         self,
         instruction: str,
         config: AgentRuntimeConfig,
+        *,
+        conversation_id: str | None = None,
     ) -> TaskRecord:
         # Persistent latch: never clear emergency stop automatically when starting a task.
         if self._emergency_stopped:
@@ -261,6 +280,7 @@ class TaskRunner:
         safe_instruction = self._scrubber.scrub_text(instruction)
         record = TaskRecord(
             task_id=task_id,
+            conversation_id=conversation_id,
             instruction=safe_instruction,
             state="pending",
             max_steps=config.max_steps,
@@ -652,6 +672,14 @@ class TaskRunner:
                 error=safe_error,
             )
         finally:
+            if record.state in TERMINAL_TASK_STATES and self._on_task_finished is not None:
+                try:
+                    await self._on_task_finished(record)
+                except Exception:
+                    logger.exception(
+                        "Failed to run task-finished callback for task %s.",
+                        record.task_id,
+                    )
             self._evict_completed_tasks()
 
     async def _request_approval(
@@ -716,10 +744,19 @@ class TaskRunner:
         return approved, reason
 
     async def _emit(self, event_type: str, **fields: Any) -> None:
+        task_id = fields.get("task_id")
+        if isinstance(task_id, str) and "conversation_id" not in fields:
+            task_rec = self._tasks.get(task_id)
+            if task_rec is not None and task_rec.conversation_id is not None:
+                fields["conversation_id"] = task_rec.conversation_id
         payload: dict[str, Any] = {
             "type": event_type,
             "timestamp": utc_now_iso(),
             **fields,
         }
         scrubbed_payload = self._scrubber.scrub_value(payload)
+        if isinstance(task_id, str):
+            task_rec = self._tasks.get(task_id)
+            if task_rec is not None:
+                task_rec.record_event(scrubbed_payload)
         await self._broadcaster(scrubbed_payload)

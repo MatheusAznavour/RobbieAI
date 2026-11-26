@@ -9,6 +9,7 @@ from fastapi import (
     APIRouter,
     Depends,
     HTTPException,
+    Query,
     Request,
     WebSocket,
     WebSocketDisconnect,
@@ -16,6 +17,7 @@ from fastapi import (
 )
 
 import robbie
+from robbie.agents.conversation import ConversationOrchestrator
 from robbie.agents.runner import (
     ApprovalConflictError,
     ApprovalMismatchError,
@@ -24,17 +26,32 @@ from robbie.agents.runner import (
 )
 from robbie.api.schemas import (
     ApprovalDecisionRequest,
+    ChatMessageResponse,
+    ConversationDetailResponse,
+    ConversationSummaryResponse,
+    CreateConversationRequest,
     CreateTaskRequest,
     EmergencyStopResetResponse,
     EmergencyStopResponse,
     ErrorEvent,
     HealthResponse,
     PongEvent,
+    RenameConversationRequest,
+    SendMessageRequest,
+    SendMessageResponse,
+    SettingsSnapshotResponse,
     StatusEvent,
     TaskStatusResponse,
+    UpdateSettingsRequest,
 )
 from robbie.core.runtime import BackendRuntime, utc_now_iso
-from robbie.core.security import require_http_auth, validate_websocket_handshake
+from robbie.core.security import (
+    get_secret_scrubber,
+    require_http_auth,
+    validate_websocket_handshake,
+)
+from robbie.memory.conversations import ConversationStore
+from robbie.providers.settings import ProviderSettingsManager
 
 logger = logging.getLogger("robbie.api")
 
@@ -42,6 +59,7 @@ router = APIRouter()
 
 
 def _build_status_event(runtime: BackendRuntime) -> dict[str, object]:
+    is_estopped = bool(runtime.task_runner and runtime.task_runner.is_emergency_stopped)
     return StatusEvent(
         status=runtime.status,
         version=robbie.__version__,
@@ -49,6 +67,7 @@ def _build_status_event(runtime: BackendRuntime) -> dict[str, object]:
         port=runtime.port,
         pid=runtime.pid,
         uptime_seconds=runtime.uptime_seconds,
+        emergency_stopped=is_estopped,
         timestamp=utc_now_iso(),
     ).model_dump()
 
@@ -63,6 +82,36 @@ def _require_task_runner(request: Request) -> TaskRunner:
     return runtime.task_runner
 
 
+def _require_conversation_store(request: Request) -> ConversationStore:
+    runtime: BackendRuntime = request.app.state.runtime
+    if runtime.conversation_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Conversation store is not initialized.",
+        )
+    return runtime.conversation_store
+
+
+def _require_orchestrator(request: Request) -> ConversationOrchestrator:
+    runtime: BackendRuntime = request.app.state.runtime
+    if runtime.orchestrator is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Conversation orchestrator is not initialized.",
+        )
+    return runtime.orchestrator
+
+
+def _require_settings_manager(request: Request) -> ProviderSettingsManager:
+    runtime: BackendRuntime = request.app.state.runtime
+    if runtime.settings_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Settings manager is not initialized.",
+        )
+    return runtime.settings_manager
+
+
 @router.get(
     "/health",
     response_model=HealthResponse,
@@ -71,6 +120,7 @@ def _require_task_runner(request: Request) -> TaskRunner:
 async def get_health(request: Request) -> HealthResponse:
     """Return authenticated health and runtime metadata."""
     runtime: BackendRuntime = request.app.state.runtime
+    is_estopped = bool(runtime.task_runner and runtime.task_runner.is_emergency_stopped)
     return HealthResponse(
         version=robbie.__version__,
         host=runtime.host,
@@ -78,8 +128,221 @@ async def get_health(request: Request) -> HealthResponse:
         pid=runtime.pid,
         uptime_seconds=runtime.uptime_seconds,
         websocket_connections=runtime.connections.active_count,
+        emergency_stopped=is_estopped,
         timestamp=utc_now_iso(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Conversations & Conversational Chat
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/conversations",
+    response_model=list[ConversationSummaryResponse],
+    dependencies=[Depends(require_http_auth)],
+)
+async def list_conversations(
+    request: Request,
+    q: str = Query(default="", max_length=200),
+) -> list[ConversationSummaryResponse]:
+    store = _require_conversation_store(request)
+    return [ConversationSummaryResponse(**item) for item in store.list_conversations(query=q)]
+
+
+@router.post(
+    "/conversations",
+    response_model=ConversationDetailResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_http_auth)],
+)
+async def create_conversation(
+    request: Request,
+    payload: CreateConversationRequest | None = None,
+) -> ConversationDetailResponse:
+    store = _require_conversation_store(request)
+    record = store.create_conversation(title=payload.title if payload else None)
+    return ConversationDetailResponse(**record.to_detail_dict(), tasks=[])
+
+
+@router.get(
+    "/conversations/{conversation_id}",
+    response_model=ConversationDetailResponse,
+    dependencies=[Depends(require_http_auth)],
+)
+async def get_conversation(
+    conversation_id: str,
+    request: Request,
+) -> ConversationDetailResponse:
+    store = _require_conversation_store(request)
+    runner = _require_task_runner(request)
+    record = store.get_conversation(conversation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found.",
+        )
+
+    tasks: list[TaskStatusResponse] = []
+    for task_id in record.task_ids:
+        task_rec = runner.get_task(task_id)
+        if task_rec is not None:
+            tasks.append(TaskStatusResponse(**task_rec.to_public_dict()))
+
+    return ConversationDetailResponse(**record.to_detail_dict(), tasks=tasks)
+
+
+@router.patch(
+    "/conversations/{conversation_id}",
+    response_model=ConversationSummaryResponse,
+    dependencies=[Depends(require_http_auth)],
+)
+async def rename_conversation(
+    conversation_id: str,
+    payload: RenameConversationRequest,
+    request: Request,
+) -> ConversationSummaryResponse:
+    store = _require_conversation_store(request)
+    try:
+        record = store.rename_conversation(conversation_id, payload.title)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return ConversationSummaryResponse(**record.to_summary_dict())
+
+
+@router.delete(
+    "/conversations/{conversation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_http_auth)],
+)
+async def delete_conversation(
+    conversation_id: str,
+    request: Request,
+) -> None:
+    store = _require_conversation_store(request)
+    try:
+        store.delete_conversation(conversation_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages",
+    response_model=SendMessageResponse,
+    dependencies=[Depends(require_http_auth)],
+)
+async def send_conversation_message(
+    conversation_id: str,
+    payload: SendMessageRequest,
+    request: Request,
+) -> SendMessageResponse:
+    store = _require_conversation_store(request)
+    orchestrator = _require_orchestrator(request)
+    scrubber = get_secret_scrubber()
+
+    try:
+        outcome = await orchestrator.send_message(
+            conversation_id,
+            payload.content,
+            mode=payload.mode,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except EmergencyStopActiveError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        safe_msg = scrubber.scrub_text(str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=safe_msg,
+        ) from exc
+    except Exception as exc:
+        safe_msg = scrubber.scrub_text(str(exc) or type(exc).__name__)
+        logger.error("Failed to process conversation message: %s", safe_msg)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Model invocation failed: {safe_msg}",
+        ) from exc
+
+    conv = store.get_conversation(conversation_id)
+    assert conv is not None
+    return SendMessageResponse(
+        conversation=ConversationSummaryResponse(**conv.to_summary_dict()),
+        user_message=ChatMessageResponse(**outcome.user_message.to_dict()),
+        assistant_message=ChatMessageResponse(**outcome.assistant_message.to_dict()),
+        task=TaskStatusResponse(**outcome.task.to_public_dict()) if outcome.task else None,
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages/{message_id}/retry",
+    response_model=SendMessageResponse,
+    dependencies=[Depends(require_http_auth)],
+)
+async def retry_conversation_message(
+    conversation_id: str,
+    message_id: str,
+    request: Request,
+) -> SendMessageResponse:
+    store = _require_conversation_store(request)
+    conv = store.get_conversation(conversation_id)
+    if conv is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found.",
+        )
+
+    target = next((m for m in conv.messages if m.message_id == message_id), None)
+    if target is None or target.role != "user":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Retryable user message not found.",
+        )
+
+    return await send_conversation_message(
+        conversation_id,
+        SendMessageRequest(content=target.content, mode="auto"),
+        request,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Provider & Model Settings (Zero Secrets)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/settings",
+    response_model=SettingsSnapshotResponse,
+    dependencies=[Depends(require_http_auth)],
+)
+async def get_settings(request: Request) -> SettingsSnapshotResponse:
+    manager = _require_settings_manager(request)
+    return SettingsSnapshotResponse(**manager.get_public_snapshot())
+
+
+@router.put(
+    "/settings",
+    response_model=SettingsSnapshotResponse,
+    dependencies=[Depends(require_http_auth)],
+)
+async def update_settings(
+    payload: UpdateSettingsRequest,
+    request: Request,
+) -> SettingsSnapshotResponse:
+    manager = _require_settings_manager(request)
+    manager.update_selection(payload.selection)
+    return SettingsSnapshotResponse(**manager.get_public_snapshot())
+
+
+# ---------------------------------------------------------------------------
+# Desktop Tasks, Approvals, and Emergency Stop
+# ---------------------------------------------------------------------------
 
 
 @router.post(
@@ -94,10 +357,17 @@ async def create_task(
 ) -> TaskStatusResponse:
     """Start a new non-blocking Agent-S S3 task (rejected if emergency stop is active)."""
     runner = _require_task_runner(request)
+    store = request.app.state.runtime.conversation_store
     try:
-        record = await runner.start_task(payload.instruction, payload.config)
+        record = await runner.start_task(
+            payload.instruction,
+            payload.config,
+            conversation_id=payload.conversation_id,
+        )
     except EmergencyStopActiveError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    if store is not None and payload.conversation_id:
+        store.link_task(payload.conversation_id, record.task_id)
     return TaskStatusResponse(**record.to_public_dict())
 
 

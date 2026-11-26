@@ -1,8 +1,18 @@
 import crypto from 'node:crypto'
 import type {
+  ApprovalDecisionPayload,
   BackendEvent,
   BackendHealthResponse,
   BackendPongEvent,
+  ChatMode,
+  ConversationDetail,
+  ConversationSummary,
+  EmergencyStopResetResponse,
+  EmergencyStopResponse,
+  ModelSelectionState,
+  SendMessageResponse,
+  SettingsSnapshot,
+  TaskRecordView,
 } from '../../shared/backend.ts'
 import { LoopbackWebSocketClient } from './wsClient.ts'
 
@@ -13,6 +23,7 @@ export interface BackendClientOptions {
   port: number
   token: string
   origin?: string
+  autoReconnect?: boolean
   onEvent?: (event: BackendEvent) => void
   onWebSocketStateChange?: (connected: boolean) => void
   onError?: (error: Error) => void
@@ -35,6 +46,9 @@ export class BackendClient {
   private readonly token: string
   private readonly origin: string
   private ws: LoopbackWebSocketClient | null = null
+  private reconnectTimer: NodeJS.Timeout | null = null
+  private reconnectAttempt = 0
+  private manuallyDisconnected = false
   private readonly pendingPings = new Map<string, PendingPing>()
 
   constructor(options: BackendClientOptions) {
@@ -49,32 +63,193 @@ export class BackendClient {
     return this.ws?.isConnected ?? false
   }
 
-  async checkHealth(timeoutMs = 5000): Promise<BackendHealthResponse> {
-    const response = await fetch(`http://${this.host}:${this.port}/health`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${this.token}`,
-        Origin: this.origin,
-      },
+  private async requestJson<T>(
+    method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+    endpointPath: string,
+    body?: unknown,
+    timeoutMs = 15000,
+  ): Promise<T> {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      Origin: this.origin,
+    }
+    let serializedBody: string | undefined
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json'
+      serializedBody = JSON.stringify(body)
+    }
+
+    const response = await fetch(`http://${this.host}:${this.port}${endpointPath}`, {
+      method,
+      headers,
+      body: serializedBody,
       signal: AbortSignal.timeout(timeoutMs),
     })
 
     if (!response.ok) {
-      throw new Error(`Backend /health check failed with HTTP ${response.status}.`)
+      let detail = `Backend request failed with HTTP ${response.status}.`
+      try {
+        const errJson = (await response.json()) as { detail?: unknown }
+        if (typeof errJson.detail === 'string' && errJson.detail.trim()) {
+          detail = `HTTP ${response.status}: ${errJson.detail}`
+        }
+      } catch {
+        // Use generic status message.
+      }
+      throw new Error(detail)
     }
 
-    const payload = (await response.json()) as Partial<BackendHealthResponse>
+    if (response.status === 204) {
+      return undefined as T
+    }
+
+    return (await response.json()) as T
+  }
+
+  async checkHealth(timeoutMs = 5000): Promise<BackendHealthResponse> {
+    const payload = await this.requestJson<Partial<BackendHealthResponse>>(
+      'GET',
+      '/health',
+      undefined,
+      timeoutMs,
+    )
     if (payload.status !== 'ok' || payload.service !== 'robbie-backend') {
       throw new Error('Backend /health returned an unexpected response payload.')
     }
-
     return payload as BackendHealthResponse
+  }
+
+  listConversations(query = ''): Promise<ConversationSummary[]> {
+    const suffix = query.trim() ? `?q=${encodeURIComponent(query.trim())}` : ''
+    return this.requestJson<ConversationSummary[]>('GET', `/conversations${suffix}`)
+  }
+
+  createConversation(title?: string): Promise<ConversationDetail> {
+    return this.requestJson<ConversationDetail>(
+      'POST',
+      '/conversations',
+      title ? { title } : {},
+    )
+  }
+
+  getConversation(conversationId: string): Promise<ConversationDetail> {
+    return this.requestJson<ConversationDetail>(
+      'GET',
+      `/conversations/${encodeURIComponent(conversationId)}`,
+    )
+  }
+
+  renameConversation(
+    conversationId: string,
+    title: string,
+  ): Promise<ConversationSummary> {
+    return this.requestJson<ConversationSummary>(
+      'PATCH',
+      `/conversations/${encodeURIComponent(conversationId)}`,
+      { title },
+    )
+  }
+
+  deleteConversation(conversationId: string): Promise<void> {
+    return this.requestJson<void>(
+      'DELETE',
+      `/conversations/${encodeURIComponent(conversationId)}`,
+    )
+  }
+
+  sendMessage(
+    conversationId: string,
+    content: string,
+    mode: ChatMode = 'auto',
+  ): Promise<SendMessageResponse> {
+    return this.requestJson<SendMessageResponse>(
+      'POST',
+      `/conversations/${encodeURIComponent(conversationId)}/messages`,
+      { content, mode },
+      100000,
+    )
+  }
+
+  retryMessage(
+    conversationId: string,
+    messageId: string,
+  ): Promise<SendMessageResponse> {
+    return this.requestJson<SendMessageResponse>(
+      'POST',
+      `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/retry`,
+      undefined,
+      100000,
+    )
+  }
+
+  listTasks(): Promise<TaskRecordView[]> {
+    return this.requestJson<TaskRecordView[]>('GET', '/tasks')
+  }
+
+  getTask(taskId: string): Promise<TaskRecordView> {
+    return this.requestJson<TaskRecordView>('GET', `/tasks/${encodeURIComponent(taskId)}`)
+  }
+
+  pauseTask(taskId: string): Promise<TaskRecordView> {
+    return this.requestJson<TaskRecordView>(
+      'POST',
+      `/tasks/${encodeURIComponent(taskId)}/pause`,
+    )
+  }
+
+  resumeTask(taskId: string): Promise<TaskRecordView> {
+    return this.requestJson<TaskRecordView>(
+      'POST',
+      `/tasks/${encodeURIComponent(taskId)}/resume`,
+    )
+  }
+
+  cancelTask(taskId: string): Promise<TaskRecordView> {
+    return this.requestJson<TaskRecordView>(
+      'POST',
+      `/tasks/${encodeURIComponent(taskId)}/cancel`,
+    )
+  }
+
+  resolveApproval(
+    taskId: string,
+    approvalId: string,
+    decision: ApprovalDecisionPayload,
+  ): Promise<TaskRecordView> {
+    return this.requestJson<TaskRecordView>(
+      'POST',
+      `/tasks/${encodeURIComponent(taskId)}/approvals/${encodeURIComponent(approvalId)}`,
+      decision,
+    )
+  }
+
+  emergencyStop(): Promise<EmergencyStopResponse> {
+    return this.requestJson<EmergencyStopResponse>('POST', '/emergency-stop', undefined, 5000)
+  }
+
+  resetEmergencyStop(): Promise<EmergencyStopResetResponse> {
+    return this.requestJson<EmergencyStopResetResponse>(
+      'POST',
+      '/emergency-stop/reset',
+      undefined,
+      5000,
+    )
+  }
+
+  getSettings(): Promise<SettingsSnapshot> {
+    return this.requestJson<SettingsSnapshot>('GET', '/settings')
+  }
+
+  updateSettings(selection: ModelSelectionState): Promise<SettingsSnapshot> {
+    return this.requestJson<SettingsSnapshot>('PUT', '/settings', { selection })
   }
 
   async connectWebSocket(timeoutMs = 5000): Promise<void> {
     if (this.ws?.isConnected) {
       return
     }
+    this.manuallyDisconnected = false
+    this.clearReconnectTimer()
 
     const client = new LoopbackWebSocketClient({
       host: this.host,
@@ -89,6 +264,7 @@ export class BackendClient {
       onClose: () => {
         this.rejectPendingPings('WebSocket connection closed.')
         this.options.onWebSocketStateChange?.(false)
+        this.scheduleReconnect()
       },
       onError: (err) => {
         this.options.onError?.(err)
@@ -97,6 +273,7 @@ export class BackendClient {
 
     await client.connect()
     this.ws = client
+    this.reconnectAttempt = 0
     this.options.onWebSocketStateChange?.(true)
   }
 
@@ -124,12 +301,39 @@ export class BackendClient {
   }
 
   disconnect(): void {
+    this.manuallyDisconnected = true
+    this.clearReconnectTimer()
     this.rejectPendingPings('Backend client disconnected.')
     if (this.ws) {
       this.ws.close()
       this.ws = null
     }
     this.options.onWebSocketStateChange?.(false)
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.manuallyDisconnected || this.options.autoReconnect === false) {
+      return
+    }
+    if (this.reconnectTimer !== null) {
+      return
+    }
+    const delayMs = Math.min(1000 * 2 ** this.reconnectAttempt, 10000)
+    this.reconnectAttempt += 1
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      if (this.manuallyDisconnected) return
+      void this.connectWebSocket().catch(() => {
+        this.scheduleReconnect()
+      })
+    }, delayMs)
   }
 
   private handleWebSocketMessage(rawText: string): void {
@@ -141,12 +345,12 @@ export class BackendClient {
       return
     }
 
-    if (parsed.type === 'pong' && parsed.request_id) {
+    if (parsed.type === 'pong' && 'request_id' in parsed && parsed.request_id) {
       const pending = this.pendingPings.get(parsed.request_id)
       if (pending) {
         clearTimeout(pending.timer)
         this.pendingPings.delete(parsed.request_id)
-        pending.resolve(parsed)
+        pending.resolve(parsed as BackendPongEvent)
       }
     }
 

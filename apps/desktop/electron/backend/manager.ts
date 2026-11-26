@@ -1,11 +1,21 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import crypto from 'node:crypto'
 import type {
+  ApprovalDecisionPayload,
   BackendEvent,
   BackendHealthResponse,
   BackendLifecycleState,
   BackendPongEvent,
   BackendStatusSnapshot,
+  ChatMode,
+  ConversationDetail,
+  ConversationSummary,
+  EmergencyStopResetResponse,
+  EmergencyStopResponse,
+  ModelSelectionState,
+  SendMessageResponse,
+  SettingsSnapshot,
+  TaskRecordView,
 } from '../../shared/backend.ts'
 import { BackendClient, TRUSTED_BACKEND_ORIGIN } from './client.ts'
 import {
@@ -101,6 +111,7 @@ export class BackendSidecarManager {
     pid: null,
     version: null,
     wsConnected: false,
+    emergencyStopped: false,
     lastError: null,
     updatedAt: nowIso(),
   }
@@ -126,6 +137,13 @@ export class BackendSidecarManager {
     return () => {
       this.eventListeners.delete(listener)
     }
+  }
+
+  private requireClient(): BackendClient {
+    if (!this.client || this.snapshot.state !== 'ready') {
+      throw new Error('Robbie backend is not ready.')
+    }
+    return this.client
   }
 
   async start(): Promise<BackendStatusSnapshot> {
@@ -160,17 +178,101 @@ export class BackendSidecarManager {
   }
 
   async checkHealth(): Promise<BackendHealthResponse> {
-    if (!this.client || this.snapshot.state !== 'ready') {
-      throw new Error('Robbie backend is not ready.')
+    const health = await this.requireClient().checkHealth()
+    if (this.snapshot.emergencyStopped !== health.emergency_stopped) {
+      this.updateSnapshot({ emergencyStopped: health.emergency_stopped })
     }
-    return this.client.checkHealth()
+    return health
   }
 
-  async ping(): Promise<BackendPongEvent> {
-    if (!this.client || this.snapshot.state !== 'ready') {
-      throw new Error('Robbie backend is not ready.')
-    }
-    return this.client.ping()
+  ping(): Promise<BackendPongEvent> {
+    return this.requireClient().ping()
+  }
+
+  listConversations(query?: string): Promise<ConversationSummary[]> {
+    return this.requireClient().listConversations(query)
+  }
+
+  createConversation(title?: string): Promise<ConversationDetail> {
+    return this.requireClient().createConversation(title)
+  }
+
+  getConversation(conversationId: string): Promise<ConversationDetail> {
+    return this.requireClient().getConversation(conversationId)
+  }
+
+  renameConversation(
+    conversationId: string,
+    title: string,
+  ): Promise<ConversationSummary> {
+    return this.requireClient().renameConversation(conversationId, title)
+  }
+
+  deleteConversation(conversationId: string): Promise<void> {
+    return this.requireClient().deleteConversation(conversationId)
+  }
+
+  sendMessage(
+    conversationId: string,
+    content: string,
+    mode?: ChatMode,
+  ): Promise<SendMessageResponse> {
+    return this.requireClient().sendMessage(conversationId, content, mode)
+  }
+
+  retryMessage(
+    conversationId: string,
+    messageId: string,
+  ): Promise<SendMessageResponse> {
+    return this.requireClient().retryMessage(conversationId, messageId)
+  }
+
+  listTasks(): Promise<TaskRecordView[]> {
+    return this.requireClient().listTasks()
+  }
+
+  getTask(taskId: string): Promise<TaskRecordView> {
+    return this.requireClient().getTask(taskId)
+  }
+
+  pauseTask(taskId: string): Promise<TaskRecordView> {
+    return this.requireClient().pauseTask(taskId)
+  }
+
+  resumeTask(taskId: string): Promise<TaskRecordView> {
+    return this.requireClient().resumeTask(taskId)
+  }
+
+  cancelTask(taskId: string): Promise<TaskRecordView> {
+    return this.requireClient().cancelTask(taskId)
+  }
+
+  resolveApproval(
+    taskId: string,
+    approvalId: string,
+    decision: ApprovalDecisionPayload,
+  ): Promise<TaskRecordView> {
+    return this.requireClient().resolveApproval(taskId, approvalId, decision)
+  }
+
+  async emergencyStop(): Promise<EmergencyStopResponse> {
+    const res = await this.requireClient().emergencyStop()
+    this.updateSnapshot({ emergencyStopped: true })
+    return res
+  }
+
+  async resetEmergencyStop(): Promise<EmergencyStopResetResponse> {
+    const res = await this.requireClient().resetEmergencyStop()
+    this.updateSnapshot({ emergencyStopped: false })
+    return res
+  }
+
+  getSettings(): Promise<SettingsSnapshot> {
+    return this.requireClient().getSettings()
+  }
+
+  updateSettings(selection: ModelSelectionState): Promise<SettingsSnapshot> {
+    return this.requireClient().updateSettings(selection)
   }
 
   private async performStart(): Promise<BackendStatusSnapshot> {
@@ -182,6 +284,7 @@ export class BackendSidecarManager {
       pid: null,
       version: null,
       wsConnected: false,
+      emergencyStopped: false,
       lastError: null,
     })
 
@@ -238,7 +341,15 @@ export class BackendSidecarManager {
         port: readyInfo.port,
         token,
         origin: TRUSTED_BACKEND_ORIGIN,
+        autoReconnect: true,
         onEvent: (event) => {
+          if (event.type === 'emergency_stop') {
+            this.updateSnapshot({ emergencyStopped: true })
+          } else if (event.type === 'emergency_stop_reset') {
+            this.updateSnapshot({ emergencyStopped: false })
+          } else if (event.type === 'status' && 'emergency_stopped' in event) {
+            this.updateSnapshot({ emergencyStopped: Boolean(event.emergency_stopped) })
+          }
           this.emitEvent(event)
         },
         onWebSocketStateChange: (connected) => {
@@ -255,8 +366,6 @@ export class BackendSidecarManager {
       })
       this.client = client
 
-      // Verify both authenticated HTTP /health and authenticated WS /ws/status
-      // before reporting the sidecar as ready.
       const health = await client.checkHealth()
       await client.connectWebSocket()
 
@@ -268,6 +377,7 @@ export class BackendSidecarManager {
         pid: health.pid,
         version: health.version,
         wsConnected: client.isWebSocketConnected,
+        emergencyStopped: health.emergency_stopped,
         lastError: null,
       })
 
@@ -457,13 +567,12 @@ export class BackendSidecarManager {
       child.once('exit', () => resolve())
     })
 
-    // Step 1: Close stdin so Python's ROBBIE_WATCH_STDIN thread triggers clean shutdown.
     try {
       if (child.stdin && !child.stdin.destroyed) {
         child.stdin.end()
       }
     } catch {
-      // Ignore pipe write errors if already closed.
+      // Ignore pipe errors if already closed.
     }
 
     if (process.platform !== 'win32') {
@@ -483,7 +592,6 @@ export class BackendSidecarManager {
       return
     }
 
-    // Step 2: Hard-terminate process tree to prevent orphaned Python processes on Windows.
     if (process.platform === 'win32' && child.pid) {
       await terminateWindowsProcessTree(child.pid)
     }

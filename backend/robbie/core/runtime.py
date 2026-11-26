@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING, Any
 from fastapi import WebSocket
 
 if TYPE_CHECKING:
+    from robbie.agents.conversation import ConversationOrchestrator
     from robbie.agents.runner import TaskRunner
+    from robbie.memory.conversations import ConversationStore
+    from robbie.providers.settings import ProviderSettingsManager
 
 
 def utc_now_iso() -> str:
@@ -76,7 +79,15 @@ class ConnectionManager:
 class BackendRuntime:
     """Holds live runtime metadata for the FastAPI application instance."""
 
-    def __init__(self, host: str, port: int, task_runner: TaskRunner | None = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        task_runner: TaskRunner | None = None,
+        conversation_store: ConversationStore | None = None,
+        settings_manager: ProviderSettingsManager | None = None,
+        orchestrator: ConversationOrchestrator | None = None,
+    ) -> None:
         self.host = host
         self.port = port
         self.pid = os.getpid()
@@ -84,6 +95,9 @@ class BackendRuntime:
         self.started_at = time.monotonic()
         self.connections = ConnectionManager()
         self.task_runner: TaskRunner | None = task_runner
+        self.conversation_store: ConversationStore | None = conversation_store
+        self.settings_manager: ProviderSettingsManager | None = settings_manager
+        self.orchestrator: ConversationOrchestrator | None = orchestrator
 
     def set_bound_port(self, port: int) -> None:
         self.port = port

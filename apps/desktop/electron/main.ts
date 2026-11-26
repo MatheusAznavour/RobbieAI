@@ -1,21 +1,25 @@
-import { app, BrowserWindow, ipcMain, session, type IpcMainInvokeEvent } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  globalShortcut,
+  ipcMain,
+  session,
+  type IpcMainInvokeEvent,
+} from 'electron'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import {
   ROBBIE_IPC_CHANNELS,
+  type ApprovalDecisionPayload,
   type BackendEvent,
   type BackendStatusSnapshot,
+  type ChatMode,
+  type ModelSelectionState,
 } from '../shared/backend'
 import { BackendSidecarManager } from './backend/manager'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// Built directory structure:
-// ├─┬ dist/
-// │ └── index.html
-// └─┬ dist-electron/
-//   ├── main.js
-//   └── preload.cjs
 process.env.APP_ROOT = path.join(__dirname, '..')
 
 export const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL']
@@ -73,6 +77,13 @@ function assertAuthorizedIpcSender(event: IpcMainInvokeEvent): void {
   }
 }
 
+function assertNonEmptyString(value: unknown, label: string, maxLen = 8000): string {
+  if (typeof value !== 'string' || !value.trim() || value.length > maxLen) {
+    throw new Error(`Invalid ${label}.`)
+  }
+  return value
+}
+
 function registerIpcHandlers(): void {
   ipcMain.handle(ROBBIE_IPC_CHANNELS.GET_BACKEND_STATUS, (event) => {
     assertAuthorizedIpcSender(event)
@@ -92,6 +103,141 @@ function registerIpcHandlers(): void {
   ipcMain.handle(ROBBIE_IPC_CHANNELS.RESTART_BACKEND, async (event) => {
     assertAuthorizedIpcSender(event)
     return backendManager.restart()
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.LIST_CONVERSATIONS, async (event, query?: unknown) => {
+    assertAuthorizedIpcSender(event)
+    const q = typeof query === 'string' ? query.slice(0, 200) : ''
+    return backendManager.listConversations(q)
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.CREATE_CONVERSATION, async (event, title?: unknown) => {
+    assertAuthorizedIpcSender(event)
+    const cleanTitle = typeof title === 'string' && title.trim() ? title.slice(0, 64) : undefined
+    return backendManager.createConversation(cleanTitle)
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.GET_CONVERSATION, async (event, conversationId: unknown) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.getConversation(assertNonEmptyString(conversationId, 'conversationId', 128))
+  })
+
+  ipcMain.handle(
+    ROBBIE_IPC_CHANNELS.RENAME_CONVERSATION,
+    async (event, conversationId: unknown, title: unknown) => {
+      assertAuthorizedIpcSender(event)
+      return backendManager.renameConversation(
+        assertNonEmptyString(conversationId, 'conversationId', 128),
+        assertNonEmptyString(title, 'title', 64),
+      )
+    },
+  )
+
+  ipcMain.handle(
+    ROBBIE_IPC_CHANNELS.DELETE_CONVERSATION,
+    async (event, conversationId: unknown) => {
+      assertAuthorizedIpcSender(event)
+      return backendManager.deleteConversation(
+        assertNonEmptyString(conversationId, 'conversationId', 128),
+      )
+    },
+  )
+
+  ipcMain.handle(
+    ROBBIE_IPC_CHANNELS.SEND_MESSAGE,
+    async (event, conversationId: unknown, content: unknown, mode?: unknown) => {
+      assertAuthorizedIpcSender(event)
+      const validMode: ChatMode =
+        mode === 'chat' || mode === 'desktop' || mode === 'auto' ? mode : 'auto'
+      return backendManager.sendMessage(
+        assertNonEmptyString(conversationId, 'conversationId', 128),
+        assertNonEmptyString(content, 'content', 8000),
+        validMode,
+      )
+    },
+  )
+
+  ipcMain.handle(
+    ROBBIE_IPC_CHANNELS.RETRY_MESSAGE,
+    async (event, conversationId: unknown, messageId: unknown) => {
+      assertAuthorizedIpcSender(event)
+      return backendManager.retryMessage(
+        assertNonEmptyString(conversationId, 'conversationId', 128),
+        assertNonEmptyString(messageId, 'messageId', 128),
+      )
+    },
+  )
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.LIST_TASKS, async (event) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.listTasks()
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.GET_TASK, async (event, taskId: unknown) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.getTask(assertNonEmptyString(taskId, 'taskId', 128))
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.PAUSE_TASK, async (event, taskId: unknown) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.pauseTask(assertNonEmptyString(taskId, 'taskId', 128))
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.RESUME_TASK, async (event, taskId: unknown) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.resumeTask(assertNonEmptyString(taskId, 'taskId', 128))
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.CANCEL_TASK, async (event, taskId: unknown) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.cancelTask(assertNonEmptyString(taskId, 'taskId', 128))
+  })
+
+  ipcMain.handle(
+    ROBBIE_IPC_CHANNELS.RESOLVE_APPROVAL,
+    async (event, taskId: unknown, approvalId: unknown, decision: unknown) => {
+      assertAuthorizedIpcSender(event)
+      if (!decision || typeof decision !== 'object') {
+        throw new Error('Invalid approval decision payload.')
+      }
+      const d = decision as Partial<ApprovalDecisionPayload>
+      if (typeof d.approved !== 'boolean') {
+        throw new Error('Approval decision requires boolean `approved`.')
+      }
+      return backendManager.resolveApproval(
+        assertNonEmptyString(taskId, 'taskId', 128),
+        assertNonEmptyString(approvalId, 'approvalId', 128),
+        {
+          approved: d.approved,
+          step_id: assertNonEmptyString(d.step_id, 'step_id', 256),
+          action_digest: assertNonEmptyString(d.action_digest, 'action_digest', 64),
+          reason: typeof d.reason === 'string' ? d.reason.slice(0, 500) : undefined,
+        },
+      )
+    },
+  )
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.EMERGENCY_STOP, async (event) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.emergencyStop()
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.RESET_EMERGENCY_STOP, async (event) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.resetEmergencyStop()
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.GET_SETTINGS, async (event) => {
+    assertAuthorizedIpcSender(event)
+    return backendManager.getSettings()
+  })
+
+  ipcMain.handle(ROBBIE_IPC_CHANNELS.UPDATE_SETTINGS, async (event, selection: unknown) => {
+    assertAuthorizedIpcSender(event)
+    if (!selection || typeof selection !== 'object') {
+      throw new Error('Invalid settings selection payload.')
+    }
+    return backendManager.updateSettings(selection as ModelSelectionState)
   })
 }
 
@@ -121,11 +267,36 @@ function configureSessionSecurity(): void {
   })
 }
 
+function registerEmergencyStopShortcut(): void {
+  const candidates = ['CommandOrControl+Alt+Escape', 'CommandOrControl+Shift+X']
+  for (const accelerator of candidates) {
+    try {
+      const ok = globalShortcut.register(accelerator, () => {
+        void backendManager.emergencyStop().catch((err: unknown) => {
+          console.error(
+            '[Robbie] Global emergency stop failed:',
+            err instanceof Error ? err.message : String(err),
+          )
+        })
+      })
+      if (ok) {
+        console.info(`[Robbie] Registered global Emergency Stop shortcut: ${accelerator}`)
+        return
+      }
+    } catch {
+      // Try next fallback shortcut.
+    }
+  }
+}
+
 function createWindow(): void {
   win = new BrowserWindow({
     title: 'Robbie',
-    width: 960,
-    height: 680,
+    width: 1280,
+    height: 820,
+    minWidth: 900,
+    minHeight: 620,
+    backgroundColor: '#0f1115',
     icon: path.join(process.env.VITE_PUBLIC, 'electron-vite.svg'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -137,7 +308,6 @@ function createWindow(): void {
     },
   })
 
-  // Prevent navigation outside the trusted application origin and block popups.
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   win.webContents.on('will-navigate', (event, targetUrl) => {
     const allowedPrefix = VITE_DEV_SERVER_URL ?? 'file://'
@@ -159,6 +329,10 @@ function createWindow(): void {
     void win.loadFile(path.join(RENDERER_DIST, 'index.html'))
   }
 }
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+})
 
 app.on('before-quit', (event) => {
   if (isQuitting) {
@@ -188,6 +362,7 @@ void app.whenReady().then(() => {
   configureSessionSecurity()
   registerIpcHandlers()
   forwardBackendUpdatesToWindow()
+  registerEmergencyStopShortcut()
   createWindow()
 
   void backendManager.start().catch((err: unknown) => {

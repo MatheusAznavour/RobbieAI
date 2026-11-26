@@ -17,11 +17,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import robbie
+from robbie.agents.conversation import ChatModelClientProtocol, ConversationOrchestrator
 from robbie.agents.runner import TaskRunner
 from robbie.api.routes import router as api_router
 from robbie.core.config import BackendSettings
 from robbie.core.runtime import BackendRuntime
 from robbie.core.security import configure_logging
+from robbie.memory.conversations import ConversationStore, resolve_data_dir
+from robbie.providers.settings import ProviderSettingsManager
 
 logger = logging.getLogger("robbie.main")
 
@@ -30,6 +33,9 @@ def create_app(
     settings: BackendSettings | None = None,
     *,
     task_runner: TaskRunner | None = None,
+    conversation_store: ConversationStore | None = None,
+    settings_manager: ProviderSettingsManager | None = None,
+    chat_client: ChatModelClientProtocol | None = None,
 ) -> FastAPI:
     """Create and configure the Robbie FastAPI application."""
     resolved_settings = settings or BackendSettings.from_env()
@@ -38,8 +44,28 @@ def create_app(
         resolved_settings.api_token.get_secret_value(),
     )
 
+    data_dir = resolve_data_dir()
     runtime = BackendRuntime(host=resolved_settings.host, port=resolved_settings.port)
-    runtime.task_runner = task_runner or TaskRunner(broadcaster=runtime.connections.broadcast_json)
+    resolved_runner = task_runner or TaskRunner(broadcaster=runtime.connections.broadcast_json)
+    resolved_store = conversation_store or ConversationStore(
+        storage_path=data_dir / "conversations.json"
+    )
+    resolved_settings_mgr = settings_manager or ProviderSettingsManager(
+        storage_path=data_dir / "settings.json"
+    )
+    orchestrator = ConversationOrchestrator(
+        store=resolved_store,
+        settings_manager=resolved_settings_mgr,
+        task_runner=resolved_runner,
+        broadcaster=runtime.connections.broadcast_json,
+        chat_client=chat_client,
+    )
+    resolved_runner.set_on_task_finished(orchestrator.handle_task_terminal_state)
+
+    runtime.task_runner = resolved_runner
+    runtime.conversation_store = resolved_store
+    runtime.settings_manager = resolved_settings_mgr
+    runtime.orchestrator = orchestrator
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -74,7 +100,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=list(resolved_settings.allowed_origins),
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
@@ -184,6 +210,9 @@ async def serve_backend(settings: BackendSettings | None = None) -> None:
 
 def main() -> None:
     """CLI entrypoint for launching the Robbie backend sidecar."""
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
     settings = BackendSettings.from_env()
     asyncio.run(serve_backend(settings))
 
