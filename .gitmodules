@@ -1,0 +1,3 @@
+[submodule "vendor/Agent-S"]
+	path = vendor/Agent-S
+	url = https://github.com/simular-ai/Agent-S.git
