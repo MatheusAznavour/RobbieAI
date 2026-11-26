@@ -1,4 +1,16 @@
-"""Privileged backend provider/model settings manager (never exposes API keys)."""
+"""Privileged backend provider/model settings manager (never exposes API keys).
+
+Configuration precedence (highest to lowest):
+1. Explicit non-empty user selection persisted in ``settings.json`` (except when a
+   legacy persisted entry contains only the built-in OpenAI fallback model paired with
+   an empty/null base URL while the environment explicitly configures a custom model
+   and endpoint).
+2. Environment configuration (``ROBBIE_CHAT_*`` / ``ROBBIE_WORKER_*``,
+   ``OPENAI_BASE_URL``, and provider-specific endpoint/credential variables).
+3. Built-in fallback defaults.
+
+Empty or ``null`` values in ``settings.json`` never erase valid environment defaults.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +28,8 @@ from robbie.providers.config import (
     SupportedProvider,
     WorkerModelConfig,
 )
+
+DEFAULT_OPENAI_MODEL: Final[str] = "gpt-5-2025-08-07"
 
 
 class ProviderMetadata(BaseModel):
@@ -38,8 +52,8 @@ PROVIDER_CATALOG: Final[tuple[dict[str, Any], ...]] = (
         "id": "openai",
         "label": "OpenAI",
         "credential_env_var": "OPENAI_API_KEY",
-        "endpoint_env_var": None,
-        "suggested_models": ("gpt-5-2025-08-07", "gpt-4.1", "gpt-4o"),
+        "endpoint_env_var": "OPENAI_BASE_URL",
+        "suggested_models": (DEFAULT_OPENAI_MODEL, "gpt-4.1", "gpt-4o"),
     },
     {
         "id": "anthropic",
@@ -124,11 +138,11 @@ class ModelSelectionState(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     chat_provider: SupportedProvider = "openai"
-    chat_model: str = Field(default="gpt-5-2025-08-07", min_length=1, max_length=200)
+    chat_model: str = Field(default=DEFAULT_OPENAI_MODEL, min_length=1, max_length=200)
     chat_base_url: str | None = Field(default=None, max_length=500)
 
     worker_provider: SupportedProvider = "openai"
-    worker_model: str = Field(default="gpt-5-2025-08-07", min_length=1, max_length=200)
+    worker_model: str = Field(default=DEFAULT_OPENAI_MODEL, min_length=1, max_length=200)
     worker_base_url: str | None = Field(default=None, max_length=500)
 
     grounding_provider: SupportedProvider = "huggingface"
@@ -169,7 +183,26 @@ def _resolve_provider_secret(provider_id: str) -> SecretStr | None:
     return SecretStr(raw) if raw else None
 
 
-def _resolve_provider_base_url(provider_id: str, configured_url: str | None) -> str | None:
+def _resolve_worker_temperature() -> float | None:
+    raw = os.environ.get("ROBBIE_WORKER_TEMPERATURE", "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return None
+    if 0.0 <= parsed <= 2.0:
+        return parsed
+    return None
+
+
+def _resolve_provider_base_url(
+    provider_id: str,
+    configured_url: str | None,
+    *,
+    allow_worker_fallback: bool = False,
+) -> str | None:
+    """Resolve provider base URL following explicit -> provider env -> worker env -> default."""
     if configured_url and configured_url.strip():
         return configured_url.strip()
     entry = _provider_env_info(provider_id)
@@ -178,11 +211,23 @@ def _resolve_provider_base_url(provider_id: str, configured_url: str | None) -> 
         raw = os.environ.get(endpoint_var, "").strip()
         if raw:
             return raw
+    if allow_worker_fallback:
+        worker_url = os.environ.get("ROBBIE_WORKER_BASE_URL", "").strip()
+        if worker_url:
+            return worker_url
     if provider_id == "gemini":
         return "https://generativelanguage.googleapis.com/v1beta/openai/"
     if provider_id == "open_router":
         return "https://openrouter.ai/api/v1"
     return None
+
+
+def _is_empty_persisted_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
 
 
 class ProviderSettingsManager:
@@ -194,12 +239,42 @@ class ProviderSettingsManager:
         self._selection = self._load_initial_selection()
 
     def _load_initial_selection(self) -> ModelSelectionState:
-        env_worker_provider = os.environ.get("ROBBIE_WORKER_PROVIDER", "openai").strip()
-        env_worker_model = os.environ.get("ROBBIE_WORKER_MODEL", "gpt-5-2025-08-07").strip()
-        env_worker_url = os.environ.get("ROBBIE_WORKER_BASE_URL", "").strip() or None
+        """Build initial model selection respecting documented env + settings.json precedence."""
+        env_worker_provider = os.environ.get("ROBBIE_WORKER_PROVIDER", "openai").strip() or "openai"
+        env_worker_model_raw = os.environ.get("ROBBIE_WORKER_MODEL", "").strip()
+        env_worker_model = env_worker_model_raw or DEFAULT_OPENAI_MODEL
+        env_worker_url = (
+            os.environ.get("ROBBIE_WORKER_BASE_URL", "").strip()
+            or (
+                os.environ.get("OPENAI_BASE_URL", "").strip()
+                if env_worker_provider == "openai"
+                else ""
+            )
+            or None
+        )
 
-        env_ground_provider = os.environ.get("ROBBIE_GROUNDING_PROVIDER", "huggingface").strip()
-        env_ground_model = os.environ.get("ROBBIE_GROUNDING_MODEL", "ui-tars-1.5-7b").strip()
+        env_chat_provider = (
+            os.environ.get("ROBBIE_CHAT_PROVIDER", "").strip() or env_worker_provider
+        )
+        env_chat_model_raw = os.environ.get("ROBBIE_CHAT_MODEL", "").strip()
+        env_chat_model = env_chat_model_raw or env_worker_model
+        env_chat_url = (
+            os.environ.get("ROBBIE_CHAT_BASE_URL", "").strip()
+            or (
+                os.environ.get("OPENAI_BASE_URL", "").strip()
+                if env_chat_provider == "openai"
+                else ""
+            )
+            or (env_worker_url if env_chat_provider == env_worker_provider else None)
+            or None
+        )
+
+        env_ground_provider = (
+            os.environ.get("ROBBIE_GROUNDING_PROVIDER", "huggingface").strip() or "huggingface"
+        )
+        env_ground_model = (
+            os.environ.get("ROBBIE_GROUNDING_MODEL", "ui-tars-1.5-7b").strip() or "ui-tars-1.5-7b"
+        )
         env_ground_url = (
             os.environ.get("ROBBIE_GROUNDING_URL", "").strip()
             or os.environ.get("HF_ENDPOINT_URL", "").strip()
@@ -213,9 +288,9 @@ class ProviderSettingsManager:
         }
 
         defaults: dict[str, Any] = {
-            "chat_provider": env_worker_provider,
-            "chat_model": env_worker_model,
-            "chat_base_url": env_worker_url,
+            "chat_provider": env_chat_provider,
+            "chat_model": env_chat_model,
+            "chat_base_url": env_chat_url,
             "worker_provider": env_worker_provider,
             "worker_model": env_worker_model,
             "worker_base_url": env_worker_url,
@@ -231,7 +306,37 @@ class ProviderSettingsManager:
             try:
                 saved = json.loads(self._storage_path.read_text(encoding="utf-8"))
                 if isinstance(saved, dict):
-                    defaults.update(saved)
+                    has_explicit_env_chat_model = bool(env_chat_model_raw or env_worker_model_raw)
+                    has_explicit_env_worker_model = bool(env_worker_model_raw)
+
+                    for key, value in saved.items():
+                        # Never let empty/null persisted values overwrite valid env defaults.
+                        if _is_empty_persisted_value(value):
+                            continue
+
+                        # Do not let a stale built-in fallback model paired with a null/empty
+                        # base URL silently override an explicitly configured custom env model
+                        # and endpoint.
+                        if (
+                            key == "chat_model"
+                            and value == DEFAULT_OPENAI_MODEL
+                            and _is_empty_persisted_value(saved.get("chat_base_url"))
+                            and has_explicit_env_chat_model
+                            and env_chat_model != DEFAULT_OPENAI_MODEL
+                            and env_chat_url is not None
+                        ):
+                            continue
+                        if (
+                            key == "worker_model"
+                            and value == DEFAULT_OPENAI_MODEL
+                            and _is_empty_persisted_value(saved.get("worker_base_url"))
+                            and has_explicit_env_worker_model
+                            and env_worker_model != DEFAULT_OPENAI_MODEL
+                            and env_worker_url is not None
+                        ):
+                            continue
+
+                        defaults[key] = value
             except Exception:
                 pass
 
@@ -332,15 +437,22 @@ class ProviderSettingsManager:
 
     def build_chat_model_config(self) -> WorkerModelConfig:
         sel = self.get_selection()
+        env_worker_provider = os.environ.get("ROBBIE_WORKER_PROVIDER", "openai").strip() or "openai"
         return WorkerModelConfig(
             provider=sel.chat_provider,
             model=sel.chat_model,
-            base_url=_resolve_provider_base_url(sel.chat_provider, sel.chat_base_url),
+            base_url=_resolve_provider_base_url(
+                sel.chat_provider,
+                sel.chat_base_url,
+                allow_worker_fallback=(sel.chat_provider == env_worker_provider),
+            ),
             api_key=_resolve_provider_secret(sel.chat_provider),
+            temperature=_resolve_worker_temperature(),
         )
 
     def build_desktop_runtime_config(self) -> AgentRuntimeConfig:
         sel = self.get_selection()
+        env_worker_provider = os.environ.get("ROBBIE_WORKER_PROVIDER", "openai").strip() or "openai"
         ground_url = _resolve_provider_base_url(sel.grounding_provider, sel.grounding_url)
         if not ground_url:
             raise ValueError(
@@ -350,8 +462,13 @@ class ProviderSettingsManager:
             worker=WorkerModelConfig(
                 provider=sel.worker_provider,
                 model=sel.worker_model,
-                base_url=_resolve_provider_base_url(sel.worker_provider, sel.worker_base_url),
+                base_url=_resolve_provider_base_url(
+                    sel.worker_provider,
+                    sel.worker_base_url,
+                    allow_worker_fallback=(sel.worker_provider == env_worker_provider),
+                ),
                 api_key=_resolve_provider_secret(sel.worker_provider),
+                temperature=_resolve_worker_temperature(),
             ),
             grounding=GroundingModelConfig(
                 provider=sel.grounding_provider,

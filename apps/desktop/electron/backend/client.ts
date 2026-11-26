@@ -166,7 +166,7 @@ export class BackendClient {
       'POST',
       `/conversations/${encodeURIComponent(conversationId)}/messages`,
       { content, mode },
-      100000,
+      105000,
     )
   }
 
@@ -178,7 +178,7 @@ export class BackendClient {
       'POST',
       `/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/retry`,
       undefined,
-      100000,
+      105000,
     )
   }
 
