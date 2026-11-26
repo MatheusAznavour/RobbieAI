@@ -233,3 +233,55 @@ test('stateReconciler tracks drafts, sorts conversations, and detects HTTP 409 c
   assert.equal(isConflictError(new Error('HTTP 409: Approval already resolved')), true)
   assert.equal(isConflictError(new Error('HTTP 500: Internal error')), false)
 })
+
+test('stateReconciler reconciles backend step_started, step_planned, and action_rejected events', () => {
+  const baseTask: TaskRecordView = {
+    task_id: 't-parity',
+    conversation_id: 'c1',
+    instruction: 'Open Firefox',
+    state: 'pending',
+    current_step: 0,
+    max_steps: 15,
+    last_step_id: null,
+    last_error: null,
+    created_at: '2026-11-26T00:00:00.000Z',
+    updated_at: '2026-11-26T00:00:00.000Z',
+    pending_approval: null,
+    events: [],
+  }
+
+  let tasks = applyTaskEvent([baseTask], {
+    type: 'step_started',
+    timestamp: '2026-11-26T00:00:01.000Z',
+    task_id: 't-parity',
+    step_id: 't-parity:step-1',
+    step_index: 1,
+  })
+  assert.equal(tasks[0].state, 'running')
+  assert.equal(tasks[0].current_step, 1)
+  assert.equal(tasks[0].last_step_id, 't-parity:step-1')
+
+  tasks = applyTaskEvent(tasks, {
+    type: 'step_planned',
+    timestamp: '2026-11-26T00:00:02.000Z',
+    task_id: 't-parity',
+    step_id: 't-parity:step-1',
+    action: { kind: 'open', target: 'Firefox' },
+    risk_level: 'high',
+    category: 'non_allowlisted_open',
+    requires_approval: true,
+  })
+  assert.equal(tasks[0].events.length, 2)
+  assert.equal(tasks[0].events[1].type, 'step_planned')
+
+  tasks = applyTaskEvent(tasks, {
+    type: 'action_rejected',
+    timestamp: '2026-11-26T00:00:03.000Z',
+    task_id: 't-parity',
+    step_id: 't-parity:step-1',
+    action: { kind: 'open', target: 'Firefox' },
+    reason: 'User denied action.',
+  })
+  assert.equal(tasks[0].events.length, 3)
+  assert.equal(tasks[0].events[2].type, 'action_rejected')
+})

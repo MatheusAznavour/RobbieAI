@@ -18,7 +18,14 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from robbie.core.runtime import utc_now_iso
 from robbie.core.security import REDACTED_MARKER, SecretScrubber, get_secret_scrubber
 from robbie.providers.config import AgentRuntimeConfig
-from robbie.tools.actions import DoneAction, FailAction, RobbieAction, TypeTextAction
+from robbie.tools.actions import (
+    DoneAction,
+    FailAction,
+    RobbieAction,
+    SaveToKnowledgeAction,
+    TypeTextAction,
+    WaitAction,
+)
 from robbie.tools.safety import ActionSafetyPolicy, SafetyDecision
 from robbie.tools.windows import (
     ActionExecutionResult,
@@ -463,9 +470,36 @@ class TaskRunner:
                 dry_run=config.dry_run,
             )
 
-            adapter = await asyncio.to_thread(self._adapter_factory, config)
-            dispatcher = await asyncio.to_thread(self._dispatcher_factory, config)
-            screen_capture = await asyncio.to_thread(self._screen_capture_factory)
+            try:
+                adapter = await asyncio.wait_for(
+                    asyncio.to_thread(self._adapter_factory, config),
+                    timeout=config.init_timeout_seconds,
+                )
+                dispatcher = await asyncio.wait_for(
+                    asyncio.to_thread(self._dispatcher_factory, config),
+                    timeout=config.init_timeout_seconds,
+                )
+                screen_capture = await asyncio.wait_for(
+                    asyncio.to_thread(self._screen_capture_factory),
+                    timeout=config.init_timeout_seconds,
+                )
+            except TimeoutError:
+                record.state = "failed"
+                record.last_error = (
+                    f"Desktop agent initialization timed out after {config.init_timeout_seconds}s."
+                )
+                record.updated_at = utc_now_iso()
+                await self._emit(
+                    "task_failed",
+                    task_id=record.task_id,
+                    step_id=step_id,
+                    error=record.last_error,
+                )
+                return
+
+            if self._is_interrupted(record):
+                await self._finalize_interruption(record, step_id)
+                return
 
             for step_index in range(1, config.max_steps + 1):
                 await self._wait_if_paused(record)
@@ -631,6 +665,20 @@ class TaskRunner:
                     detail=self._scrubber.scrub_text(exec_result.detail),
                 )
 
+                # Interruptible post-action settle delay so Windows UI finishes rendering
+                # before the next screenshot while preserving instant Emergency Stop response.
+                if config.post_action_settle_seconds > 0 and not isinstance(
+                    prediction.action,
+                    (DoneAction, FailAction, SaveToKnowledgeAction, WaitAction),
+                ):
+                    interrupted = await asyncio.to_thread(
+                        record.stop_event.wait,
+                        config.post_action_settle_seconds,
+                    )
+                    if interrupted or self._is_interrupted(record):
+                        await self._finalize_interruption(record, step_id)
+                        return
+
             record.state = "failed"
             record.last_error = (
                 f"Reached maximum step limit ({config.max_steps}) without completion."
@@ -644,9 +692,10 @@ class TaskRunner:
             )
         except ActionInterruptedError:
             await self._finalize_interruption(record, step_id)
-        except TimeoutError:
+        except TimeoutError as exc:
+            detail = self._scrubber.scrub_text(str(exc)) if str(exc) else ""
             record.state = "failed"
-            record.last_error = f"Task timed out after {config.step_timeout_seconds}s."
+            record.last_error = detail or f"Task timed out after {config.step_timeout_seconds}s."
             record.updated_at = utc_now_iso()
             await self._emit(
                 "task_failed",

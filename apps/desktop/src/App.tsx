@@ -45,7 +45,9 @@ const INITIAL_STATUS: BackendStatusSnapshot = {
 
 const TASK_EVENT_TYPES = new Set([
   'task_started',
-  'action_planned',
+  'step_started',
+  'step_planned',
+  'action_rejected',
   'approval_required',
   'approval_resolved',
   'action_executed',

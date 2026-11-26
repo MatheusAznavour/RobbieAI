@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import logging
 import re
+import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 from gui_agents.s3.agents.agent_s import AgentS3
 from gui_agents.s3.agents.worker import Worker
+from gui_agents.s3.core.mllm import LMMAgent
 from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
-from gui_agents.s3.utils.common_utils import call_llm_formatted, parse_code_from_string
+from gui_agents.s3.utils.common_utils import parse_code_from_string, split_thinking_response
 from gui_agents.s3.utils.formatters import SINGLE_ACTION_FORMATTER
 
+from robbie.agents.llm_engine import (
+    DEFAULT_DESKTOP_MAX_RETRIES,
+    build_robbie_lmm_agent,
+    call_robbie_llm,
+    call_robbie_llm_formatted,
+)
 from robbie.agents.windows_aci import RobbieWindowsACI
 from robbie.providers.config import AgentRuntimeConfig
 from robbie.tools.actions import (
@@ -41,6 +49,15 @@ CODE_AGENT_SECTION_RE = re.compile(
 )
 
 
+def call_llm_formatted(
+    generator: Any,
+    format_checkers: list[Callable[[str], tuple[bool, str]]],
+    **kwargs: Any,
+) -> str:
+    """Bounded, non-swallowing replacement for upstream Agent-S call_llm_formatted."""
+    return call_robbie_llm_formatted(generator, format_checkers, **kwargs)
+
+
 @dataclass(frozen=True)
 class StepPrediction:
     """Structured output from a single Agent-S S3 turn."""
@@ -53,7 +70,8 @@ class StepPrediction:
 
 
 class SafeRobbieWorker(Worker):
-    """Subclass of Agent-S S3 Worker that eliminates internal `eval()` calls.
+    """Subclass of Agent-S S3 Worker that eliminates internal `eval()` calls
+    and uses Robbie's bounded OpenAI-compatible engine.
 
     Upstream `Worker.generate_next_action` calls `common_utils.create_pyautogui_code`
     which executes raw `eval(code)` twice (once in `CODE_VALID_FORMATTER` and again
@@ -63,6 +81,44 @@ class SafeRobbieWorker(Worker):
     """
 
     grounding_agent: RobbieWindowsACI
+
+    def __init__(
+        self,
+        worker_engine_params: dict[str, Any],
+        grounding_agent: RobbieWindowsACI,
+        platform: str = "windows",
+        max_trajectory_length: int = 8,
+        enable_reflection: bool = True,
+        *,
+        http_timeout_seconds: float | None = None,
+        max_retries: int = DEFAULT_DESKTOP_MAX_RETRIES,
+        client_factory: Callable[..., Any] | None = None,
+    ) -> None:
+        self._http_timeout_seconds = http_timeout_seconds
+        self._max_retries = max_retries
+        self._client_factory = client_factory
+        super().__init__(
+            worker_engine_params=worker_engine_params,
+            grounding_agent=grounding_agent,
+            platform=platform,
+            max_trajectory_length=max_trajectory_length,
+            enable_reflection=enable_reflection,
+        )
+        # Preserve upstream CLI default: None when temperature is omitted (do not coerce to 0.0).
+        self.temperature = worker_engine_params.get("temperature")
+
+    def _create_agent(
+        self,
+        system_prompt: str | None = None,
+        engine_params: dict[str, Any] | None = None,
+    ) -> LMMAgent:
+        return build_robbie_lmm_agent(
+            engine_params or self.engine_params,
+            system_prompt=system_prompt,
+            http_timeout_seconds=self._http_timeout_seconds,
+            max_retries=self._max_retries,
+            client_factory=self._client_factory,
+        )
 
     def reset(self) -> None:
         if not isinstance(self.grounding_agent, RobbieWindowsACI):
@@ -89,6 +145,43 @@ class SafeRobbieWorker(Worker):
         self.reflections = []
         self.cost_this_turn = 0
         self.screenshot_inputs = []
+
+    def _generate_reflection(
+        self,
+        instruction: str,
+        obs: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        reflection: str | None = None
+        reflection_thoughts: str | None = None
+        if self.enable_reflection:
+            if self.turn_count == 0:
+                text_content = textwrap.dedent(
+                    f"""
+                    Task Description: {instruction}
+                    Current Trajectory below:
+                    """
+                )
+                updated_sys_prompt = self.reflection_agent.system_prompt + "\n" + text_content
+                self.reflection_agent.add_system_prompt(updated_sys_prompt)
+                self.reflection_agent.add_message(
+                    text_content="The initial screen is provided. No action has been taken yet.",
+                    image_content=obs["screenshot"],
+                    role="user",
+                )
+            else:
+                self.reflection_agent.add_message(
+                    text_content=self.worker_history[-1],
+                    image_content=obs["screenshot"],
+                    role="user",
+                )
+                full_reflection = call_robbie_llm(
+                    self.reflection_agent,
+                    temperature=self.temperature,
+                    use_thinking=self.use_thinking,
+                )
+                reflection, reflection_thoughts = split_thinking_response(full_reflection)
+                self.reflections.append(reflection)
+        return reflection, reflection_thoughts
 
     def _validate_ast_call_format(self, response: str) -> tuple[bool, str]:
         code = parse_code_from_string(response)
@@ -172,6 +265,7 @@ class SafeRobbieWorker(Worker):
             format_checkers,
             temperature=self.temperature,
             use_thinking=self.use_thinking,
+            cancel_check=cancel_check,
         )
         self.worker_history.append(plan)
         self.generator_agent.add_message(plan, role="assistant")
@@ -201,6 +295,29 @@ class SafeRobbieWorker(Worker):
 class RobbieAgentS3(AgentS3):
     """Subclass of AgentS3 wiring SafeRobbieWorker without modifying vendor/Agent-S."""
 
+    def __init__(
+        self,
+        worker_engine_params: dict[str, Any],
+        grounding_agent: RobbieWindowsACI,
+        platform: str = "windows",
+        max_trajectory_length: int = 8,
+        enable_reflection: bool = True,
+        *,
+        http_timeout_seconds: float | None = None,
+        max_retries: int = DEFAULT_DESKTOP_MAX_RETRIES,
+        client_factory: Callable[..., Any] | None = None,
+    ) -> None:
+        self._http_timeout_seconds = http_timeout_seconds
+        self._max_retries = max_retries
+        self._client_factory = client_factory
+        super().__init__(
+            worker_engine_params=worker_engine_params,
+            grounding_agent=grounding_agent,
+            platform=platform,
+            max_trajectory_length=max_trajectory_length,
+            enable_reflection=enable_reflection,
+        )
+
     def reset(self) -> None:
         if not isinstance(self.grounding_agent, RobbieWindowsACI):
             raise UnsafeActionCodeError("RobbieAgentS3 requires a RobbieWindowsACI instance.")
@@ -210,6 +327,9 @@ class RobbieAgentS3(AgentS3):
             platform="windows",
             max_trajectory_length=self.max_trajectory_length,
             enable_reflection=self.enable_reflection,
+            http_timeout_seconds=self._http_timeout_seconds,
+            max_retries=self._max_retries,
+            client_factory=self._client_factory,
         )
 
 
@@ -224,6 +344,9 @@ class AgentS3Adapter:
         tesseract_cmd: str | None = None,
         aci: RobbieWindowsACI | None = None,
         agent: RobbieAgentS3 | None = None,
+        http_timeout_seconds: float | None = None,
+        max_retries: int = DEFAULT_DESKTOP_MAX_RETRIES,
+        client_factory: Callable[..., Any] | None = None,
     ) -> None:
         if aci is not None and not isinstance(aci, RobbieWindowsACI):
             raise UnsafeActionCodeError(
@@ -245,6 +368,9 @@ class AgentS3Adapter:
             engine_params_for_grounding=grounding_params,
             display_info=self.display_info,
             tesseract_cmd=tesseract_cmd,
+            http_timeout_seconds=http_timeout_seconds,
+            max_retries=max_retries,
+            client_factory=client_factory,
         )
         self.agent = agent or RobbieAgentS3(
             worker_engine_params=worker_params,
@@ -252,6 +378,9 @@ class AgentS3Adapter:
             platform="windows",
             max_trajectory_length=config.max_trajectory_length,
             enable_reflection=config.enable_reflection,
+            http_timeout_seconds=http_timeout_seconds,
+            max_retries=max_retries,
+            client_factory=client_factory,
         )
         self._assert_safe_runtime()
 

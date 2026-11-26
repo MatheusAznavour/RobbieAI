@@ -77,7 +77,9 @@ export interface PendingApproval {
 
 export type TaskEventType =
   | 'task_started'
-  | 'action_planned'
+  | 'step_started'
+  | 'step_planned'
+  | 'action_rejected'
   | 'approval_required'
   | 'approval_resolved'
   | 'action_executed'

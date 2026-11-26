@@ -228,3 +228,97 @@ test('BackendSidecarManager reports startup failure cleanly', async () => {
   assert.equal(snapshot.state, 'error')
   assert.ok(snapshot.lastError?.includes('code=42'))
 })
+
+test('BackendSidecarManager drains > 64 KB of stdout after readiness without deadlocking', async () => {
+  const mockServerScript = `
+const http = require('node:http');
+const token = process.env.ROBBIE_API_TOKEN;
+const server = http.createServer((req, res) => {
+  if (req.headers.authorization !== 'Bearer ' + token) {
+    res.writeHead(401);
+    res.end();
+    return;
+  }
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'ok',
+      service: 'robbie-backend',
+      version: '0.1.0',
+      host: '127.0.0.1',
+      port: server.address().port,
+      pid: process.pid,
+      uptime_seconds: 1.0,
+      websocket_connections: 0,
+      emergency_stopped: false,
+      timestamp: new Date().toISOString(),
+    }));
+    return;
+  }
+  if (req.url === '/conversations') {
+    // Emit > 128 KB to stdout after readiness to verify the parent keeps draining the pipe.
+    const line = 'Agent-S stdout diagnostic payload ' + 'X'.repeat(200) + '\\n';
+    for (let i = 0; i < 650; i++) {
+      process.stdout.write(line);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('[]');
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+server.on('upgrade', (_req, socket) => {
+  socket.write('HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n');
+  const crypto = require('node:crypto');
+  const key = _req.headers['sec-websocket-key'];
+  const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+  socket.write('Sec-WebSocket-Accept: ' + accept + '\\r\\n\\r\\n');
+});
+server.listen(0, '127.0.0.1', () => {
+  const port = server.address().port;
+  process.stdout.write(JSON.stringify({
+    event: 'robbie_backend_ready',
+    host: '127.0.0.1',
+    port,
+    pid: process.pid,
+    version: '0.1.0',
+  }) + '\\n');
+});
+process.stdin.resume();
+process.stdin.on('end', () => { server.close(() => process.exit(0)); });
+`
+
+  const manager = new BackendSidecarManager({
+    isPackaged: false,
+    appRoot: DESKTOP_ROOT,
+    startupTimeoutMs: 10000,
+    shutdownTimeoutMs: 5000,
+    launchConfigOverride: {
+      command: process.execPath,
+      args: ['-e', mockServerScript],
+      cwd: DESKTOP_ROOT,
+      mode: 'override-bin',
+    },
+    logger: {
+      info: () => undefined,
+      warn: () => undefined,
+      error: () => undefined,
+    },
+  })
+
+  try {
+    const started = await manager.start()
+    assert.equal(started.state, 'ready')
+
+    // Triggers > 128 KB synchronous stdout writes inside the child sidecar
+    const convs = await manager.listConversations()
+    assert.deepEqual(convs, [])
+
+    // Child must remain responsive after heavy stdout emission (zero pipe deadlock)
+    const health = await manager.checkHealth()
+    assert.equal(health.status, 'ok')
+  } finally {
+    await manager.stop()
+  }
+})

@@ -6,12 +6,18 @@ import inspect
 import logging
 import os
 import re
+from collections.abc import Callable
 from typing import Any, Literal
 
 import pytesseract
 from gui_agents.s3.agents.grounding import OSWorldACI, agent_action
-from gui_agents.s3.utils.common_utils import call_llm_safe
+from gui_agents.s3.memory.procedural_memory import PROCEDURAL_MEMORY
 
+from robbie.agents.llm_engine import (
+    DEFAULT_DESKTOP_MAX_RETRIES,
+    build_robbie_lmm_agent,
+    call_robbie_llm,
+)
 from robbie.tools.actions import (
     ClickAction,
     DoneAction,
@@ -36,6 +42,21 @@ from robbie.tools.windows import (
 )
 
 logger = logging.getLogger("robbie.agents.windows_aci")
+
+
+def call_llm_safe(
+    agent: Any,
+    temperature: float | None = None,
+    use_thinking: bool = False,
+    **kwargs: Any,
+) -> str:
+    """Bounded, non-swallowing replacement for upstream Agent-S call_llm_safe."""
+    return call_robbie_llm(
+        agent,
+        temperature=temperature,
+        use_thinking=use_thinking,
+        **kwargs,
+    )
 
 
 class GroundingError(RuntimeError):
@@ -77,6 +98,8 @@ class RobbieWindowsACI(OSWorldACI):
       instead of raw Python/PyAutoGUI code strings intended for `exec()`.
     - Eliminates Linux-only fallbacks (`wmctrl`, `apt-get xclip`, LibreOffice `uno`).
     - Detects native Tesseract availability gracefully without crashing at init.
+    - Uses Robbie's bounded OpenAI-compatible engine for OpenAI-compatible grounding
+      and text-span models without modifying `vendor/Agent-S`.
     """
 
     def __init__(
@@ -86,6 +109,9 @@ class RobbieWindowsACI(OSWorldACI):
         engine_params_for_grounding: dict[str, Any],
         display_info: DisplayInfo | None = None,
         tesseract_cmd: str | None = None,
+        http_timeout_seconds: float | None = None,
+        max_retries: int = DEFAULT_DESKTOP_MAX_RETRIES,
+        client_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.display_info = display_info or get_windows_display_info()
         self.tesseract_status: TesseractStatus = detect_tesseract(tesseract_cmd)
@@ -103,6 +129,20 @@ class RobbieWindowsACI(OSWorldACI):
             engine_params_for_grounding=engine_params_for_grounding,
             width=self.display_info.primary_width,
             height=self.display_info.primary_height,
+        )
+        # Replace upstream unbounded LMMAgent engines with Robbie's bounded engine.
+        self.grounding_model = build_robbie_lmm_agent(
+            engine_params_for_grounding,
+            http_timeout_seconds=http_timeout_seconds,
+            max_retries=max_retries,
+            client_factory=client_factory,
+        )
+        self.text_span_agent = build_robbie_lmm_agent(
+            engine_params_for_generation,
+            system_prompt=PROCEDURAL_MEMORY.PHRASE_TO_WORD_COORDS_PROMPT,
+            http_timeout_seconds=http_timeout_seconds,
+            max_retries=max_retries,
+            client_factory=client_factory,
         )
         # Clear unused upstream CodeAgent instance as defense-in-depth.
         self.code_agent = None
@@ -228,7 +268,14 @@ class RobbieWindowsACI(OSWorldACI):
         button_type: str = "left",
         hold_keys: list[str] | None = None,
     ) -> RobbieAction:
-        """Click on a grounded UI element."""
+        """Click on the element
+        Args:
+            element_description:str, a detailed descriptions of which element to click on.
+                This description should be at least a full sentence.
+            num_clicks:int, number of times to click the element
+            button_type:str, which mouse button to press can be "left", "middle", or "right"
+            hold_keys:List, list of keys to hold while clicking
+        """
         coords = self.generate_coords(element_description, self.obs)
         x, y = self.resize_coordinates(coords)
         return ClickAction(
@@ -242,12 +289,20 @@ class RobbieWindowsACI(OSWorldACI):
 
     @agent_action
     def switch_applications(self, app_code: str) -> RobbieAction:
-        """Switch focus to an already-open Windows application."""
+        """Switch to a different application that is already open
+        Args:
+            app_code:str the code name of the application to switch to from the provided
+                list of open applications
+        """
         return SwitchApplicationAction(app_name=app_code)
 
     @agent_action
     def open(self, app_or_filename: str) -> RobbieAction:
-        """Open a Windows application or safe document file by structured target."""
+        """Open any application or file with name app_or_filename. Use this action to open
+        applications or files on the desktop, do not open manually.
+        Args:
+            app_or_filename:str, the name of the application or filename to open
+        """
         cleaned = app_or_filename.strip()
         _, ext = os.path.splitext(cleaned.lower())
         target_kind: Literal["application", "file"] = (
@@ -265,7 +320,16 @@ class RobbieWindowsACI(OSWorldACI):
         overwrite: bool = False,
         enter: bool = False,
     ) -> RobbieAction:
-        """Type ASCII or Unicode text into a grounded UI element."""
+        """Type text/unicode into a specific element
+        Args:
+            element_description:str, a detailed description of which element to enter text in.
+                This description should be at least a full sentence.
+            text:str, the text to type
+            overwrite:bool, Assign it to True if the text should overwrite the existing text,
+                otherwise assign it to False. Using this argument clears all text in an element.
+            enter:bool, Assign it to True if the enter key should be pressed after typing the
+                text, otherwise assign it to False.
+        """
         x: int | None = None
         y: int | None = None
         if element_description is not None:
@@ -282,7 +346,11 @@ class RobbieWindowsACI(OSWorldACI):
 
     @agent_action
     def save_to_knowledge(self, text: list[str]) -> RobbieAction:
-        """Store short string task notes in the session knowledge buffer."""
+        """Save facts, elements, texts, etc. to a long-term knowledge bank for reuse during
+        this task. Can be used for copy-pasting text, saving elements, etc.
+        Args:
+            text:List[str] the text to save to the knowledge
+        """
         if not isinstance(text, list) or not all(isinstance(item, str) for item in text):
             raise ValueError("save_to_knowledge requires a flat list of strings.")
         self.notes.extend(text)
@@ -295,7 +363,14 @@ class RobbieWindowsACI(OSWorldACI):
         ending_description: str,
         hold_keys: list[str] | None = None,
     ) -> RobbieAction:
-        """Drag from one grounded UI element to another."""
+        """Drag from the starting description to the ending description
+        Args:
+            starting_description:str, a very detailed description of where to start the drag
+                action. This description should be at least a full sentence.
+            ending_description:str, a very detailed description of where to end the drag
+                action. This description should be at least a full sentence.
+            hold_keys:List list of keys to hold while dragging
+        """
         c1 = self.resize_coordinates(self.generate_coords(starting_description, self.obs))
         c2 = self.resize_coordinates(self.generate_coords(ending_description, self.obs))
         return DragAndDropAction(
@@ -315,7 +390,17 @@ class RobbieWindowsACI(OSWorldACI):
         ending_phrase: str,
         button: str = "left",
     ) -> RobbieAction:
-        """Highlight a text span using native Tesseract OCR when available."""
+        """Highlight a text span between a provided starting phrase and ending phrase.
+        Use this to highlight words, lines, and paragraphs.
+        Args:
+            starting_phrase:str, the phrase that denotes the start of the text span you want
+                to highlight. If you only want to highlight one word, just pass in that single
+                word.
+            ending_phrase:str, the phrase that denotes the end of the text span you want to
+                highlight. If you only want to highlight one word, just pass in that single word.
+            button:str, the button to use to highlight the text span. Defaults to "left".
+                Can be "left", "right", or "middle".
+        """
         c1 = self.generate_text_coords(starting_phrase, self.obs, alignment="start")
         c2 = self.generate_text_coords(ending_phrase, self.obs, alignment="end")
         return HighlightTextSpanAction(
@@ -335,7 +420,13 @@ class RobbieWindowsACI(OSWorldACI):
         clicks: int,
         shift: bool = False,
     ) -> RobbieAction:
-        """Scroll vertically or horizontally at a grounded UI element."""
+        """Scroll the element in the specified direction
+        Args:
+            element_description:str, a very detailed description of which element to enter
+                scroll in. This description should be at least a full sentence.
+            clicks:int, the number of clicks to scroll can be positive (up) or negative (down).
+            shift:bool, whether to use shift+scroll for horizontal scrolling
+        """
         x, y = self.resize_coordinates(self.generate_coords(element_description, self.obs))
         return ScrollAction(
             x=x,
@@ -347,12 +438,19 @@ class RobbieWindowsACI(OSWorldACI):
 
     @agent_action
     def hotkey(self, keys: list[str]) -> RobbieAction:
-        """Press a validated keyboard hotkey combination."""
+        """Press a hotkey combination
+        Args:
+            keys:List the keys to press in combination in a list format (e.g. ['ctrl', 'c'])
+        """
         return HotkeyAction(keys=list(keys))
 
     @agent_action
     def hold_and_press(self, hold_keys: list[str], press_keys: list[str]) -> RobbieAction:
-        """Hold modifier keys while pressing a sequence of keys."""
+        """Hold a list of keys and press a list of keys
+        Args:
+            hold_keys:List, list of keys to hold
+            press_keys:List, list of keys to press in a sequence
+        """
         return HoldAndPressAction(
             hold_keys=list(hold_keys),
             press_keys=list(press_keys),
@@ -360,17 +458,24 @@ class RobbieWindowsACI(OSWorldACI):
 
     @agent_action
     def wait(self, time: float) -> RobbieAction:
-        """Wait for a bounded duration in seconds."""
+        """Wait for a specified amount of time
+        Args:
+            time:float the amount of time to wait in seconds
+        """
         return WaitAction(seconds=float(time))
 
     @agent_action
     def done(self) -> RobbieAction:
-        """Signal successful task completion."""
+        """End the current task with a success.
+        Use this when you believe the entire task has been fully completed.
+        """
         return DoneAction()
 
     @agent_action
     def fail(self) -> RobbieAction:
-        """Signal that the task cannot be completed."""
+        """End the current task with a failure.
+        Use this when you believe the entire task is impossible to complete.
+        """
         return FailAction()
 
     @agent_action

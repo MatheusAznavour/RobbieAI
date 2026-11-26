@@ -30,6 +30,9 @@ from robbie.providers.config import (
 )
 
 DEFAULT_OPENAI_MODEL: Final[str] = "gpt-5-2025-08-07"
+DEFAULT_GROUNDING_PROVIDER: Final[SupportedProvider] = "huggingface"
+DEFAULT_GROUNDING_MODEL: Final[str] = "ui-tars-1.5-7b"
+DEFAULT_MAX_TRAJECTORY_LENGTH: Final[int] = 8
 
 
 class ProviderMetadata(BaseModel):
@@ -196,6 +199,17 @@ def _resolve_worker_temperature() -> float | None:
     return None
 
 
+def _resolve_max_trajectory_length() -> int:
+    raw = os.environ.get("ROBBIE_MAX_TRAJECTORY_LENGTH", "").strip()
+    if not raw:
+        return DEFAULT_MAX_TRAJECTORY_LENGTH
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return DEFAULT_MAX_TRAJECTORY_LENGTH
+    return max(1, min(parsed, 20))
+
+
 def _resolve_provider_base_url(
     provider_id: str,
     configured_url: str | None,
@@ -269,12 +283,10 @@ class ProviderSettingsManager:
             or None
         )
 
-        env_ground_provider = (
-            os.environ.get("ROBBIE_GROUNDING_PROVIDER", "huggingface").strip() or "huggingface"
-        )
-        env_ground_model = (
-            os.environ.get("ROBBIE_GROUNDING_MODEL", "ui-tars-1.5-7b").strip() or "ui-tars-1.5-7b"
-        )
+        env_ground_provider_raw = os.environ.get("ROBBIE_GROUNDING_PROVIDER", "").strip()
+        env_ground_provider = env_ground_provider_raw or DEFAULT_GROUNDING_PROVIDER
+        env_ground_model_raw = os.environ.get("ROBBIE_GROUNDING_MODEL", "").strip()
+        env_ground_model = env_ground_model_raw or DEFAULT_GROUNDING_MODEL
         env_ground_url = (
             os.environ.get("ROBBIE_GROUNDING_URL", "").strip()
             or os.environ.get("HF_ENDPOINT_URL", "").strip()
@@ -308,6 +320,9 @@ class ProviderSettingsManager:
                 if isinstance(saved, dict):
                     has_explicit_env_chat_model = bool(env_chat_model_raw or env_worker_model_raw)
                     has_explicit_env_worker_model = bool(env_worker_model_raw)
+                    saved_grounding_url_empty = _is_empty_persisted_value(
+                        saved.get("grounding_url")
+                    )
 
                     for key, value in saved.items():
                         # Never let empty/null persisted values overwrite valid env defaults.
@@ -333,6 +348,22 @@ class ProviderSettingsManager:
                             and has_explicit_env_worker_model
                             and env_worker_model != DEFAULT_OPENAI_MODEL
                             and env_worker_url is not None
+                        ):
+                            continue
+                        if (
+                            key == "grounding_provider"
+                            and value == DEFAULT_GROUNDING_PROVIDER
+                            and saved_grounding_url_empty
+                            and bool(env_ground_provider_raw)
+                            and env_ground_provider != DEFAULT_GROUNDING_PROVIDER
+                        ):
+                            continue
+                        if (
+                            key == "grounding_model"
+                            and value == DEFAULT_GROUNDING_MODEL
+                            and saved_grounding_url_empty
+                            and bool(env_ground_model_raw)
+                            and env_ground_model != DEFAULT_GROUNDING_MODEL
                         ):
                             continue
 
@@ -479,5 +510,6 @@ class ProviderSettingsManager:
                 grounding_height=sel.grounding_height,
             ),
             max_steps=sel.max_steps,
+            max_trajectory_length=_resolve_max_trajectory_length(),
             enable_reflection=sel.enable_reflection,
         )

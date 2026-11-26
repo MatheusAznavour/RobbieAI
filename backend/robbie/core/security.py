@@ -165,8 +165,14 @@ def is_origin_allowed(origin: str | None, allowed_origins: tuple[str, ...]) -> b
     return origin.strip() in allowed_origins
 
 
-def require_http_auth(request: Request) -> None:
-    """FastAPI dependency enforcing Bearer token authentication on HTTP routes."""
+async def require_http_auth(request: Request) -> None:
+    """FastAPI dependency enforcing Bearer token authentication on HTTP routes.
+
+    Implemented as ``async def`` because bearer token verification is pure
+    in-memory constant-time comparison; keeping it async prevents FastAPI from
+    offloading every authenticated HTTP request to AnyIO's synchronous worker
+    thread pool.
+    """
     expected_token: str = request.app.state.settings.api_token.get_secret_value()
     provided_token = extract_bearer_token(request.headers.get("authorization"))
     if not verify_bearer_token(provided_token, expected_token):

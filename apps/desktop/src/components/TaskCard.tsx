@@ -48,9 +48,15 @@ function describeEvent(ev: TaskEventItem): string {
   switch (ev.type) {
     case 'task_started':
       return 'Desktop execution started'
-    case 'action_planned': {
+    case 'step_started':
+      return `Step ${ev.step_index ?? '?'} started`
+    case 'step_planned': {
       const kind = String(ev.action?.kind ?? 'action')
       return `Planned ${kind}${ev.risk_level ? ` (${ev.risk_level} risk)` : ''}`
+    }
+    case 'action_rejected': {
+      const kind = String(ev.action?.kind ?? 'action')
+      return `Rejected ${kind}${ev.reason ? ` — ${ev.reason}` : ''}`
     }
     case 'approval_required':
       return `Approval requested (${ev.approval?.category ?? 'policy gate'})`

@@ -326,12 +326,14 @@ export class BackendSidecarManager {
     this.child = child
 
     const stderrTail: string[] = []
+    const stdoutTail: string[] = []
     let readyInfo: ReadyStdoutMessage
 
     try {
       readyInfo = await this.waitForReadyStdout(
         child,
         token,
+        stdoutTail,
         stderrTail,
         this.options.startupTimeoutMs ?? 15000,
       )
@@ -403,18 +405,32 @@ export class BackendSidecarManager {
   private waitForReadyStdout(
     child: ChildProcess,
     token: string,
+    stdoutTail: string[],
     stderrTail: string[],
     timeoutMs: number,
   ): Promise<ReadyStdoutMessage> {
     return new Promise((resolve, reject) => {
       let stdoutBuffer = ''
       let settled = false
+      let readyResolved = false
+
+      const appendBoundedLine = (target: string[], raw: string, maxLines: number) => {
+        const sanitized = sanitizeText(raw, token).trim()
+        if (!sanitized) return
+        const bounded =
+          sanitized.length > 1024 ? `${sanitized.slice(0, 1021)}...` : sanitized
+        target.push(bounded)
+        if (target.length > maxLines) {
+          target.shift()
+        }
+      }
 
       const finish = (fn: () => void) => {
         if (settled) return
         settled = true
         clearTimeout(timer)
-        child.stdout?.off('data', onStdout)
+        // Keep `onStdout` and `onStderr` attached for the child's full lifetime so
+        // stdout/stderr pipes are continuously drained and never stall Python on Windows.
         child.off('error', onError)
         child.off('exit', onExit)
         fn()
@@ -432,27 +448,39 @@ export class BackendSidecarManager {
       }, timeoutMs)
 
       const onStdout = (chunk: Buffer) => {
-        stdoutBuffer += chunk.toString('utf8')
+        const text = chunk.toString('utf8')
+        if (readyResolved) {
+          appendBoundedLine(stdoutTail, text, 40)
+          return
+        }
+
+        stdoutBuffer += text
         let newlineIdx = stdoutBuffer.indexOf('\n')
         while (newlineIdx !== -1) {
           const line = stdoutBuffer.slice(0, newlineIdx)
           stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1)
           const parsed = parseReadyLine(line)
           if (parsed) {
+            readyResolved = true
+            if (stdoutBuffer.trim()) {
+              appendBoundedLine(stdoutTail, stdoutBuffer, 40)
+            }
+            stdoutBuffer = ''
             finish(() => resolve(parsed))
             return
           }
+          appendBoundedLine(stdoutTail, line, 40)
           newlineIdx = stdoutBuffer.indexOf('\n')
+        }
+        // Prevent unbounded buffer growth if stdout emits large lines before readiness.
+        if (stdoutBuffer.length > 65536) {
+          appendBoundedLine(stdoutTail, stdoutBuffer.slice(0, 1024), 40)
+          stdoutBuffer = stdoutBuffer.slice(-4096)
         }
       }
 
       const onStderr = (chunk: Buffer) => {
-        const sanitized = sanitizeText(chunk.toString('utf8'), token).trim()
-        if (!sanitized) return
-        stderrTail.push(sanitized)
-        if (stderrTail.length > 10) {
-          stderrTail.shift()
-        }
+        appendBoundedLine(stderrTail, chunk.toString('utf8'), 40)
       }
 
       const onError = (err: Error) => {
@@ -474,6 +502,10 @@ export class BackendSidecarManager {
       child.stderr?.on('data', onStderr)
       child.once('error', onError)
       child.once('exit', onExit)
+      child.once('close', () => {
+        child.stdout?.off('data', onStdout)
+        child.stderr?.off('data', onStderr)
+      })
     })
   }
 

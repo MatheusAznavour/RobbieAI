@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 
 import pytest
@@ -11,7 +12,7 @@ from starlette.websockets import WebSocketDisconnect
 
 import robbie
 from robbie.core.config import BackendSettings
-from robbie.core.security import TokenRedactingFilter
+from robbie.core.security import TokenRedactingFilter, require_http_auth
 from robbie.main import create_app
 
 TEST_TOKEN = "test-session-token-with-sufficient-entropy-12345"
@@ -64,6 +65,11 @@ def test_settings_mask_token_and_redacting_filter_scrubs_logs() -> None:
     assert log_filter.filter(record) is True
     assert TEST_TOKEN not in record.getMessage()
     assert "[REDACTED]" in record.getMessage()
+
+
+def test_require_http_auth_is_coroutine_function() -> None:
+    """Keep HTTP auth async so FastAPI never dispatches it to AnyIO worker threads."""
+    assert inspect.iscoroutinefunction(require_http_auth) is True
 
 
 def test_health_requires_valid_bearer_token() -> None:

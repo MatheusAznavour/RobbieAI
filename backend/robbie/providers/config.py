@@ -65,8 +65,8 @@ class WorkerModelConfig(BaseModel):
             secret = self.api_key.get_secret_value().strip()
             if secret:
                 params["api_key"] = secret
-        if self.temperature is not None:
-            params["temperature"] = self.temperature
+        # Explicitly propagate None when omitted to match Agent-S CLI defaults.
+        params["temperature"] = self.temperature
         if self.api_version:
             params["api_version"] = self.api_version
         if self.organization:
@@ -125,6 +125,8 @@ class AgentRuntimeConfig(BaseModel):
     max_steps: int = Field(default=15, ge=1, le=100)
     max_trajectory_length: int = Field(default=8, ge=1, le=20)
     enable_reflection: bool = True
+    init_timeout_seconds: float = Field(default=30.0, gt=0.0, le=120.0)
     step_timeout_seconds: float = Field(default=120.0, gt=0.0, le=600.0)
     approval_timeout_seconds: float = Field(default=120.0, gt=0.0, le=600.0)
+    post_action_settle_seconds: float = Field(default=0.85, ge=0.0, le=5.0)
     dry_run: bool = False

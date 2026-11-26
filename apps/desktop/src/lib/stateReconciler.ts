@@ -110,6 +110,7 @@ export function upsertTaskRecord(
 function eventToTaskState(event: TaskEventItem): TaskLifecycleState | null {
   switch (event.type) {
     case 'task_started':
+    case 'step_started':
     case 'task_resumed':
       return 'running'
     case 'task_paused':

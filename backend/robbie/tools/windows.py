@@ -35,7 +35,11 @@ from robbie.tools.actions import (
     TypeTextAction,
     WaitAction,
 )
-from robbie.tools.safety import classify_open_target
+from robbie.tools.safety import (
+    BLOCKED_INTERPRETERS_AND_LOLBINS,
+    SHELL_METACHAR_PATTERN,
+    classify_open_target,
+)
 
 logger = logging.getLogger("robbie.tools.windows")
 
@@ -294,12 +298,106 @@ class AppLauncherProtocol(Protocol):
     def launch(self, target: str, target_kind: str = "application") -> str: ...
 
 
+def _default_windows_app_paths_registry_reader(exe_name: str) -> list[str]:
+    """Query Windows HKCU/HKLM App Paths registry keys for an executable name."""
+    if platform.system() != "Windows":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+    results: list[str] = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                value, _reg_type = winreg.QueryValueEx(key, "")
+                if isinstance(value, str) and value.strip():
+                    results.append(value.strip())
+        except OSError:
+            continue
+    return results
+
+
+def _validate_resolved_executable_path(
+    raw_value: str,
+    *,
+    file_exists: Any = os.path.isfile,
+) -> str | None:
+    """Validate a registry-resolved executable path strictly (no args, no LOLBins, no UNC)."""
+    candidate = raw_value.strip()
+    if len(candidate) >= 2 and candidate[0] == '"' and candidate[-1] == '"':
+        candidate = candidate[1:-1].strip()
+    if not candidate:
+        return None
+    if candidate.startswith("\\\\") or candidate.startswith("//"):
+        return None
+    if SHELL_METACHAR_PATTERN.search(candidate):
+        return None
+
+    expanded = os.path.expandvars(candidate).strip()
+    if not os.path.isabs(expanded):
+        return None
+    if not expanded.lower().endswith(".exe"):
+        return None
+
+    basename = os.path.basename(expanded).lower()
+    stem = os.path.splitext(basename)[0]
+    if stem in BLOCKED_INTERPRETERS_AND_LOLBINS or basename in BLOCKED_INTERPRETERS_AND_LOLBINS:
+        return None
+
+    if not file_exists(expanded):
+        return None
+    return expanded
+
+
+def resolve_windows_app_path(
+    app_name: str,
+    *,
+    registry_reader: Any = None,
+    file_exists: Any = os.path.isfile,
+) -> str | None:
+    """Resolve an approved application name via Windows App Paths registry safely."""
+    cleaned = app_name.strip()
+    if not cleaned or "\\" in cleaned or "/" in cleaned:
+        return None
+    if any(ch.isspace() for ch in cleaned):
+        return None
+    if SHELL_METACHAR_PATTERN.search(cleaned):
+        return None
+
+    stem = os.path.splitext(cleaned.lower())[0]
+    if (
+        stem in BLOCKED_INTERPRETERS_AND_LOLBINS
+        or cleaned.lower() in BLOCKED_INTERPRETERS_AND_LOLBINS
+    ):
+        return None
+
+    exe_name = cleaned if cleaned.lower().endswith(".exe") else f"{cleaned}.exe"
+    reader = registry_reader or _default_windows_app_paths_registry_reader
+    for raw_candidate in reader(exe_name):
+        validated = _validate_resolved_executable_path(raw_candidate, file_exists=file_exists)
+        if validated is not None:
+            return validated
+    return None
+
+
 class WindowsAppLauncher:
     """Controlled Windows application/document launcher.
 
     Never interprets targets as shell commands, never passes CLI arguments, and
     never types arbitrary strings into Windows Start search.
     """
+
+    def __init__(
+        self,
+        *,
+        app_path_resolver: Any = None,
+        popen_fn: Any = None,
+    ) -> None:
+        self._app_path_resolver = app_path_resolver or resolve_windows_app_path
+        self._popen = popen_fn or subprocess.Popen
 
     def launch(self, target: str, target_kind: str = "application") -> str:
         classification = classify_open_target(target)
@@ -316,7 +414,7 @@ class WindowsAppLauncher:
                 raise ActionExecutionError(
                     f"Allowlisted Windows binary '{classification.resolved_executable}' not found."
                 )
-            subprocess.Popen([resolved], shell=False)
+            self._popen([resolved], shell=False)
             return f"Launched allowlisted application '{classification.resolved_executable}'."
 
         # 2. User-approved safe document file opened via OS file association (no shell).
@@ -327,11 +425,22 @@ class WindowsAppLauncher:
             os.startfile(expanded)  # type: ignore[attr-defined]
             return f"Opened approved document '{os.path.basename(expanded)}'."
 
-        # 3. User-approved non-allowlisted application resolved strictly via PATH (no args).
+        # 3. User-approved non-allowlisted application resolved via PATH (no args, no shell).
         resolved_app = shutil.which(target)
         if resolved_app:
-            subprocess.Popen([resolved_app], shell=False)
-            return f"Launched approved application '{os.path.basename(resolved_app)}'."
+            validated_path = _validate_resolved_executable_path(resolved_app)
+            if validated_path is None:
+                raise ActionExecutionError(
+                    f"Resolved PATH target for '{target}' failed executable validation."
+                )
+            self._popen([validated_path], shell=False)
+            return f"Launched approved application '{os.path.basename(validated_path)}'."
+
+        # 4. User-approved non-allowlisted application resolved via Windows App Paths registry.
+        registry_app = self._app_path_resolver(target)
+        if registry_app:
+            self._popen([registry_app], shell=False)
+            return f"Launched approved application '{os.path.basename(registry_app)}'."
 
         raise ActionExecutionError(
             f"Could not safely resolve application or document target '{target}'."
