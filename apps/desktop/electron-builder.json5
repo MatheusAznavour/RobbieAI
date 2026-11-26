@@ -1,9 +1,9 @@
 // @see - https://www.electron.build/configuration/configuration
 {
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
-  "appId": "YourAppID",
+  "appId": "com.robbie.desktop",
   "asar": true,
-  "productName": "YourAppName",
+  "productName": "Robbie",
   "directories": {
     "output": "release/${version}"
   },
@@ -11,12 +11,8 @@
     "dist",
     "dist-electron"
   ],
-  "mac": {
-    "target": [
-      "dmg"
-    ],
-    "artifactName": "${productName}-Mac-${version}-Installer.${ext}"
-  },
+  // Robbie currently targets Windows x64. Python backend bundling (`extraResources`)
+  // and custom `.ico` assets will be configured in a later packaging milestone.
   "win": {
     "target": [
       {
@@ -33,11 +29,5 @@
     "perMachine": false,
     "allowToChangeInstallationDirectory": true,
     "deleteAppDataOnUninstall": false
-  },
-  "linux": {
-    "target": [
-      "AppImage"
-    ],
-    "artifactName": "${productName}-Linux-${version}.${ext}"
   }
 }

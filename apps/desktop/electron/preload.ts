@@ -1,24 +1,49 @@
-import { ipcRenderer, contextBridge } from 'electron'
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
+import {
+  ROBBIE_IPC_CHANNELS,
+  type BackendEvent,
+  type BackendHealthResponse,
+  type BackendPongEvent,
+  type BackendStatusSnapshot,
+  type RobbieApi,
+} from '../shared/backend'
 
-// --------- Expose some API to the Renderer process ---------
-contextBridge.exposeInMainWorld('ipcRenderer', {
-  on(...args: Parameters<typeof ipcRenderer.on>) {
-    const [channel, listener] = args
-    return ipcRenderer.on(channel, (event, ...args) => listener(event, ...args))
-  },
-  off(...args: Parameters<typeof ipcRenderer.off>) {
-    const [channel, ...omit] = args
-    return ipcRenderer.off(channel, ...omit)
-  },
-  send(...args: Parameters<typeof ipcRenderer.send>) {
-    const [channel, ...omit] = args
-    return ipcRenderer.send(channel, ...omit)
-  },
-  invoke(...args: Parameters<typeof ipcRenderer.invoke>) {
-    const [channel, ...omit] = args
-    return ipcRenderer.invoke(channel, ...omit)
+// Expose only a narrow, typed API to the Renderer.
+// Never expose raw ipcRenderer, Node.js APIs, or backend bearer tokens.
+const robbieApi: RobbieApi = {
+  getBackendStatus: (): Promise<BackendStatusSnapshot> =>
+    ipcRenderer.invoke(ROBBIE_IPC_CHANNELS.GET_BACKEND_STATUS),
+
+  checkHealth: (): Promise<BackendHealthResponse> =>
+    ipcRenderer.invoke(ROBBIE_IPC_CHANNELS.CHECK_HEALTH),
+
+  pingBackend: (): Promise<BackendPongEvent> =>
+    ipcRenderer.invoke(ROBBIE_IPC_CHANNELS.PING_BACKEND),
+
+  restartBackend: (): Promise<BackendStatusSnapshot> =>
+    ipcRenderer.invoke(ROBBIE_IPC_CHANNELS.RESTART_BACKEND),
+
+  onBackendStatusChange: (
+    listener: (snapshot: BackendStatusSnapshot) => void,
+  ): (() => void) => {
+    const wrapped = (_event: IpcRendererEvent, snapshot: BackendStatusSnapshot) => {
+      listener(snapshot)
+    }
+    ipcRenderer.on(ROBBIE_IPC_CHANNELS.STATUS_CHANGED, wrapped)
+    return () => {
+      ipcRenderer.off(ROBBIE_IPC_CHANNELS.STATUS_CHANGED, wrapped)
+    }
   },
 
-  // You can expose other APTs you need here.
-  // ...
-})
+  onBackendEvent: (listener: (event: BackendEvent) => void): (() => void) => {
+    const wrapped = (_event: IpcRendererEvent, payload: BackendEvent) => {
+      listener(payload)
+    }
+    ipcRenderer.on(ROBBIE_IPC_CHANNELS.BACKEND_EVENT, wrapped)
+    return () => {
+      ipcRenderer.off(ROBBIE_IPC_CHANNELS.BACKEND_EVENT, wrapped)
+    }
+  },
+}
+
+contextBridge.exposeInMainWorld('robbie', robbieApi)

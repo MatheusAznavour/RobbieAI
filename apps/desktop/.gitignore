@@ -7,9 +7,13 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Dependencies & Build Outputs
 node_modules
 dist
+dist-electron
 dist-ssr
+release
+*.tsbuildinfo
 *.local
 
 # Editor directories and files

@@ -1,0 +1,18 @@
+# Normalize text line endings across environments
+* text=auto eol=lf
+
+# Windows scripts should keep CRLF line endings
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+
+# Binary files
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.woff2 binary
