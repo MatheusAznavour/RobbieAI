@@ -6,8 +6,12 @@ import asyncio
 import os
 import time
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 
 from fastapi import WebSocket
+
+if TYPE_CHECKING:
+    from robbie.agents.runner import TaskRunner
 
 
 def utc_now_iso() -> str:
@@ -34,6 +38,23 @@ class ConnectionManager:
     def active_count(self) -> int:
         return len(self._connections)
 
+    async def broadcast_json(self, payload: dict[str, Any]) -> None:
+        """Broadcast a structured JSON event to all authenticated WebSocket clients."""
+        async with self._lock:
+            targets = list(self._connections)
+
+        stale: list[WebSocket] = []
+        for websocket in targets:
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                stale.append(websocket)
+
+        if stale:
+            async with self._lock:
+                for websocket in stale:
+                    self._connections.discard(websocket)
+
     async def close_all(self) -> None:
         """Notify and close all active WebSocket connections gracefully."""
         async with self._lock:
@@ -55,13 +76,14 @@ class ConnectionManager:
 class BackendRuntime:
     """Holds live runtime metadata for the FastAPI application instance."""
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, task_runner: TaskRunner | None = None) -> None:
         self.host = host
         self.port = port
         self.pid = os.getpid()
         self.status = "starting"
         self.started_at = time.monotonic()
         self.connections = ConnectionManager()
+        self.task_runner: TaskRunner | None = task_runner
 
     def set_bound_port(self, port: int) -> None:
         self.port = port

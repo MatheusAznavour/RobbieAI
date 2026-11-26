@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import robbie
+from robbie.agents.runner import TaskRunner
 from robbie.api.routes import router as api_router
 from robbie.core.config import BackendSettings
 from robbie.core.runtime import BackendRuntime
@@ -25,7 +26,11 @@ from robbie.core.security import configure_logging
 logger = logging.getLogger("robbie.main")
 
 
-def create_app(settings: BackendSettings | None = None) -> FastAPI:
+def create_app(
+    settings: BackendSettings | None = None,
+    *,
+    task_runner: TaskRunner | None = None,
+) -> FastAPI:
     """Create and configure the Robbie FastAPI application."""
     resolved_settings = settings or BackendSettings.from_env()
     configure_logging(
@@ -34,6 +39,7 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
     )
 
     runtime = BackendRuntime(host=resolved_settings.host, port=resolved_settings.port)
+    runtime.task_runner = task_runner or TaskRunner(broadcaster=runtime.connections.broadcast_json)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -48,6 +54,8 @@ def create_app(settings: BackendSettings | None = None) -> FastAPI:
             yield
         finally:
             app.state.runtime.mark_shutting_down()
+            if app.state.runtime.task_runner is not None:
+                await app.state.runtime.task_runner.shutdown()
             await app.state.runtime.connections.close_all()
             logger.info("Robbie backend shutdown complete.")
 

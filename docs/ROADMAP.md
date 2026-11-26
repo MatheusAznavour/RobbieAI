@@ -26,13 +26,14 @@
 
 ---
 
-## Milestone 2 — Agent-S S3 Adapter & Safe Windows ACI
+## Milestone 2 — Agent-S S3 Adapter & Safe Windows ACI *(Completed)*
 
 **Goal:** Integrate `gui_agents.s3` behind a clean, Windows-adapted, non-blocking backend layer.
 
-- Implement `backend/robbie/agents/` runner executing `AgentS3` turns off FastAPI's event loop with cooperative pause/cancel support and structured step events.
-- Implement `RobbieWindowsACI` subclassing `OSWorldACI` to fix Windows application switching (`pywinauto`/`win32gui`), enforce Windows DPI awareness, detect optional Tesseract availability gracefully, and keep unsafe `LocalEnv` disabled by default.
-- Replace raw `exec()` with a constrained, allowlisted PyAutoGUI action parser and dispatcher.
+- [x] Implement `RobbieWindowsACI` subclassing `OSWorldACI` with `env=None`, DPI awareness, safe coordinate clamping, native Windows window switching (`win32gui`/`psutil`), native clipboard typing, and graceful optional Tesseract detection.
+- [x] Implement `AgentS3Adapter` (`RobbieAgentS3` + `SafeRobbieWorker`) replacing upstream `eval()`/`exec()` with AST-only action call parsing and typed `RobbieAction` models.
+- [x] Implement `ActionSafetyPolicy` and `WindowsActionDispatcher` enforcing non-bypassable approval gates for sensitive/destructive actions and rejecting unsupported actions.
+- [x] Implement non-blocking `TaskRunner` and authenticated FastAPI task/approval/emergency-stop endpoints streaming structured events (`task_id`, `step_id`) over `/ws/status`.
 
 ---
 

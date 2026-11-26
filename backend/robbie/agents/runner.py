@@ -1,0 +1,554 @@
+"""Non-blocking Agent-S task orchestrator with pause, cancel, emergency stop, and approvals."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+from robbie.core.runtime import utc_now_iso
+from robbie.providers.config import AgentRuntimeConfig
+from robbie.tools.actions import DoneAction, FailAction, RobbieAction, TypeTextAction
+from robbie.tools.safety import ActionSafetyPolicy, SafetyDecision
+from robbie.tools.windows import (
+    ActionExecutionResult,
+    ScreenCaptureProtocol,
+    WindowsActionDispatcher,
+    WindowsScreenCapture,
+)
+
+if TYPE_CHECKING:
+    from robbie.agents.adapter import StepPrediction
+
+logger = logging.getLogger("robbie.agents.runner")
+
+TaskState = Literal[
+    "pending",
+    "running",
+    "paused",
+    "awaiting_approval",
+    "completed",
+    "failed",
+    "cancelled",
+    "emergency_stopped",
+]
+
+TERMINAL_TASK_STATES: frozenset[str] = frozenset(
+    {"completed", "failed", "cancelled", "emergency_stopped"}
+)
+
+
+class StepPredictorProtocol(Protocol):
+    def reset(self) -> None: ...
+    def predict_step(
+        self,
+        instruction: str,
+        screenshot_png: bytes,
+        *,
+        cancel_check: Callable[[], bool] | None = None,
+    ) -> StepPrediction: ...
+
+
+class ActionDispatcherProtocol(Protocol):
+    def execute(self, action: RobbieAction) -> ActionExecutionResult: ...
+
+
+EventBroadcaster = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+def _sanitize_action_for_event(action: RobbieAction, category: str) -> dict[str, Any]:
+    """Serialize action metadata for status/WebSocket events without leaking secrets."""
+    payload = action.model_dump()
+    if isinstance(action, TypeTextAction) and category == "credential_access":
+        payload["text"] = "[REDACTED]"
+    return payload
+
+
+@dataclass
+class PendingApproval:
+    approval_id: str
+    task_id: str
+    step_id: str
+    action: dict[str, Any]
+    risk_level: str
+    category: str
+    reasons: list[str]
+    created_at: str
+    future: asyncio.Future[tuple[bool, str | None]] = field(repr=False)
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "approval_id": self.approval_id,
+            "task_id": self.task_id,
+            "step_id": self.step_id,
+            "action": self.action,
+            "risk_level": self.risk_level,
+            "category": self.category,
+            "reasons": self.reasons,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass
+class TaskRecord:
+    task_id: str
+    instruction: str
+    state: TaskState = "pending"
+    current_step: int = 0
+    max_steps: int = 15
+    last_step_id: str | None = None
+    last_error: str | None = None
+    created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
+    pending_approval: PendingApproval | None = None
+    resume_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    cancel_requested: bool = False
+    emergency_stop_requested: bool = False
+    bg_task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.resume_event.set()
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "instruction": self.instruction,
+            "state": self.state,
+            "current_step": self.current_step,
+            "max_steps": self.max_steps,
+            "last_step_id": self.last_step_id,
+            "last_error": self.last_error,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "pending_approval": (
+                self.pending_approval.to_public_dict() if self.pending_approval else None
+            ),
+        }
+
+
+def _default_adapter_factory(config: AgentRuntimeConfig) -> StepPredictorProtocol:
+    """Lazily import Agent-S S3 off the FastAPI startup path."""
+    from robbie.agents.adapter import AgentS3Adapter
+
+    return AgentS3Adapter(config)
+
+
+class TaskRunner:
+    """Runs Agent-S S3 tasks asynchronously off FastAPI's event loop."""
+
+    def __init__(
+        self,
+        *,
+        broadcaster: EventBroadcaster,
+        safety_policy: ActionSafetyPolicy | None = None,
+        adapter_factory: Callable[[AgentRuntimeConfig], StepPredictorProtocol] | None = None,
+        dispatcher_factory: Callable[[AgentRuntimeConfig], ActionDispatcherProtocol] | None = None,
+        screen_capture_factory: Callable[[], ScreenCaptureProtocol] | None = None,
+    ) -> None:
+        self._broadcaster = broadcaster
+        self._safety_policy = safety_policy or ActionSafetyPolicy()
+        self._adapter_factory = adapter_factory or _default_adapter_factory
+        self._dispatcher_factory = dispatcher_factory or (
+            lambda cfg: WindowsActionDispatcher(dry_run=cfg.dry_run)
+        )
+        self._screen_capture_factory = screen_capture_factory or (lambda: WindowsScreenCapture())
+        self._tasks: dict[str, TaskRecord] = {}
+        self._emergency_stopped = False
+
+    def get_task(self, task_id: str) -> TaskRecord | None:
+        return self._tasks.get(task_id)
+
+    def list_tasks(self) -> list[dict[str, Any]]:
+        return [record.to_public_dict() for record in self._tasks.values()]
+
+    async def start_task(
+        self,
+        instruction: str,
+        config: AgentRuntimeConfig,
+    ) -> TaskRecord:
+        self._emergency_stopped = False
+        task_id = str(uuid.uuid4())
+        record = TaskRecord(
+            task_id=task_id,
+            instruction=instruction,
+            state="pending",
+            max_steps=config.max_steps,
+        )
+        self._tasks[task_id] = record
+        record.bg_task = asyncio.create_task(
+            self._run_task(record, config),
+            name=f"robbie-task-{task_id[:8]}",
+        )
+        return record
+
+    async def pause_task(self, task_id: str) -> TaskRecord:
+        record = self._require_task(task_id)
+        if record.state in TERMINAL_TASK_STATES:
+            raise ValueError(f"Cannot pause task in terminal state '{record.state}'.")
+        record.resume_event.clear()
+        if record.state != "awaiting_approval":
+            record.state = "paused"
+            record.updated_at = utc_now_iso()
+        await self._emit("task_paused", task_id=task_id, step_id=record.last_step_id)
+        return record
+
+    async def resume_task(self, task_id: str) -> TaskRecord:
+        record = self._require_task(task_id)
+        if record.state in TERMINAL_TASK_STATES:
+            raise ValueError(f"Cannot resume task in terminal state '{record.state}'.")
+        record.resume_event.set()
+        if record.state == "paused":
+            record.state = "running"
+            record.updated_at = utc_now_iso()
+        await self._emit("task_resumed", task_id=task_id, step_id=record.last_step_id)
+        return record
+
+    async def cancel_task(self, task_id: str) -> TaskRecord:
+        record = self._require_task(task_id)
+        if record.state in TERMINAL_TASK_STATES:
+            return record
+        record.cancel_requested = True
+        record.resume_event.set()
+        if record.pending_approval and not record.pending_approval.future.done():
+            record.pending_approval.future.set_result((False, "Task cancelled."))
+        return record
+
+    async def resolve_approval(
+        self,
+        task_id: str,
+        approval_id: str,
+        *,
+        approved: bool,
+        reason: str | None = None,
+    ) -> TaskRecord:
+        record = self._require_task(task_id)
+        pending = record.pending_approval
+        if pending is None or pending.approval_id != approval_id:
+            raise KeyError(f"No pending approval '{approval_id}' for task '{task_id}'.")
+        if not pending.future.done():
+            pending.future.set_result((approved, reason))
+        return record
+
+    async def emergency_stop(self) -> list[str]:
+        """Immediately halt all active tasks and reject pending approvals."""
+        self._emergency_stopped = True
+        affected: list[str] = []
+        for record in self._tasks.values():
+            if record.state not in TERMINAL_TASK_STATES:
+                record.emergency_stop_requested = True
+                record.cancel_requested = True
+                record.resume_event.set()
+                if record.pending_approval and not record.pending_approval.future.done():
+                    record.pending_approval.future.set_result((False, "Emergency stop activated."))
+                affected.append(record.task_id)
+
+        await self._emit("emergency_stop", affected_task_ids=affected)
+        return affected
+
+    async def shutdown(self) -> None:
+        """Cancel all running tasks cleanly during backend shutdown."""
+        await self.emergency_stop()
+        bg_tasks = [
+            record.bg_task
+            for record in self._tasks.values()
+            if record.bg_task is not None and not record.bg_task.done()
+        ]
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+    def _require_task(self, task_id: str) -> TaskRecord:
+        record = self._tasks.get(task_id)
+        if record is None:
+            raise KeyError(f"Task '{task_id}' not found.")
+        return record
+
+    def _is_interrupted(self, record: TaskRecord) -> bool:
+        return record.cancel_requested or record.emergency_stop_requested or self._emergency_stopped
+
+    async def _finalize_interruption(self, record: TaskRecord, step_id: str | None) -> None:
+        if record.emergency_stop_requested or self._emergency_stopped:
+            record.state = "emergency_stopped"
+            record.updated_at = utc_now_iso()
+            await self._emit("task_emergency_stopped", task_id=record.task_id, step_id=step_id)
+        else:
+            record.state = "cancelled"
+            record.updated_at = utc_now_iso()
+            await self._emit("task_cancelled", task_id=record.task_id, step_id=step_id)
+
+    async def _wait_if_paused(self, record: TaskRecord) -> None:
+        if not record.resume_event.is_set() and not self._is_interrupted(record):
+            record.state = "paused"
+            record.updated_at = utc_now_iso()
+            await record.resume_event.wait()
+            if not self._is_interrupted(record):
+                record.state = "running"
+                record.updated_at = utc_now_iso()
+
+    async def _run_task(self, record: TaskRecord, config: AgentRuntimeConfig) -> None:
+        step_id: str | None = None
+        try:
+            record.state = "running"
+            record.updated_at = utc_now_iso()
+            await self._emit(
+                "task_started",
+                task_id=record.task_id,
+                max_steps=config.max_steps,
+                dry_run=config.dry_run,
+            )
+
+            adapter = await asyncio.to_thread(self._adapter_factory, config)
+            dispatcher = await asyncio.to_thread(self._dispatcher_factory, config)
+            screen_capture = await asyncio.to_thread(self._screen_capture_factory)
+
+            for step_index in range(1, config.max_steps + 1):
+                await self._wait_if_paused(record)
+                if self._is_interrupted(record):
+                    await self._finalize_interruption(record, step_id)
+                    return
+
+                step_id = f"{record.task_id}:step-{step_index}"
+                record.current_step = step_index
+                record.last_step_id = step_id
+                record.updated_at = utc_now_iso()
+                await self._emit(
+                    "step_started",
+                    task_id=record.task_id,
+                    step_id=step_id,
+                    step_index=step_index,
+                )
+
+                screenshot = await asyncio.wait_for(
+                    asyncio.to_thread(screen_capture.capture_png),
+                    timeout=config.step_timeout_seconds,
+                )
+
+                if self._is_interrupted(record):
+                    await self._finalize_interruption(record, step_id)
+                    return
+
+                prediction = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        adapter.predict_step,
+                        record.instruction,
+                        screenshot,
+                        cancel_check=lambda: self._is_interrupted(record),
+                    ),
+                    timeout=config.step_timeout_seconds,
+                )
+
+                await self._wait_if_paused(record)
+                if self._is_interrupted(record):
+                    await self._finalize_interruption(record, step_id)
+                    return
+
+                decision: SafetyDecision = self._safety_policy.evaluate(
+                    prediction.action,
+                    task_instruction=record.instruction,
+                )
+                safe_action = _sanitize_action_for_event(prediction.action, decision.category)
+
+                await self._emit(
+                    "step_planned",
+                    task_id=record.task_id,
+                    step_id=step_id,
+                    action=safe_action,
+                    risk_level=decision.risk_level,
+                    category=decision.category,
+                    requires_approval=decision.requires_approval,
+                )
+
+                if isinstance(prediction.action, DoneAction):
+                    record.state = "completed"
+                    record.updated_at = utc_now_iso()
+                    await self._emit(
+                        "task_completed",
+                        task_id=record.task_id,
+                        step_id=step_id,
+                        steps_executed=step_index,
+                    )
+                    return
+
+                if isinstance(prediction.action, FailAction):
+                    record.state = "failed"
+                    record.last_error = "Agent determined the task cannot be completed."
+                    record.updated_at = utc_now_iso()
+                    await self._emit(
+                        "task_failed",
+                        task_id=record.task_id,
+                        step_id=step_id,
+                        error=record.last_error,
+                    )
+                    return
+
+                if not decision.allowed:
+                    reason = "; ".join(decision.reasons) or "Action blocked by safety policy."
+                    await self._emit(
+                        "action_rejected",
+                        task_id=record.task_id,
+                        step_id=step_id,
+                        action=safe_action,
+                        category=decision.category,
+                        reason=reason,
+                    )
+                    record.state = "failed"
+                    record.last_error = reason
+                    record.updated_at = utc_now_iso()
+                    await self._emit(
+                        "task_failed",
+                        task_id=record.task_id,
+                        step_id=step_id,
+                        error=reason,
+                    )
+                    return
+
+                if decision.requires_approval:
+                    approved, approval_reason = await self._request_approval(
+                        record=record,
+                        step_id=step_id,
+                        safe_action=safe_action,
+                        decision=decision,
+                        timeout_seconds=config.approval_timeout_seconds,
+                    )
+                    if self._is_interrupted(record):
+                        await self._finalize_interruption(record, step_id)
+                        return
+                    if not approved:
+                        deny_reason = approval_reason or "Sensitive action was denied by user."
+                        await self._emit(
+                            "action_rejected",
+                            task_id=record.task_id,
+                            step_id=step_id,
+                            action=safe_action,
+                            category=decision.category,
+                            reason=deny_reason,
+                        )
+                        record.state = "cancelled"
+                        record.last_error = deny_reason
+                        record.updated_at = utc_now_iso()
+                        await self._emit(
+                            "task_cancelled",
+                            task_id=record.task_id,
+                            step_id=step_id,
+                            reason=deny_reason,
+                        )
+                        return
+
+                await self._wait_if_paused(record)
+                if self._is_interrupted(record):
+                    await self._finalize_interruption(record, step_id)
+                    return
+
+                exec_result = await asyncio.wait_for(
+                    asyncio.to_thread(dispatcher.execute, prediction.action),
+                    timeout=config.step_timeout_seconds,
+                )
+                await self._emit(
+                    "action_executed",
+                    task_id=record.task_id,
+                    step_id=step_id,
+                    action=safe_action,
+                    result_status=exec_result.status,
+                    detail=exec_result.detail,
+                )
+
+            record.state = "failed"
+            record.last_error = (
+                f"Reached maximum step limit ({config.max_steps}) without completion."
+            )
+            record.updated_at = utc_now_iso()
+            await self._emit(
+                "task_failed",
+                task_id=record.task_id,
+                step_id=step_id,
+                error=record.last_error,
+            )
+        except TimeoutError:
+            record.state = "failed"
+            record.last_error = f"Task timed out after {config.step_timeout_seconds}s."
+            record.updated_at = utc_now_iso()
+            await self._emit(
+                "task_failed",
+                task_id=record.task_id,
+                step_id=step_id,
+                error=record.last_error,
+            )
+        except asyncio.CancelledError:
+            record.cancel_requested = True
+            await self._finalize_interruption(record, step_id)
+            raise
+        except Exception as exc:
+            logger.exception("Task %s failed with unexpected error.", record.task_id)
+            record.state = "failed"
+            record.last_error = str(exc) or type(exc).__name__
+            record.updated_at = utc_now_iso()
+            await self._emit(
+                "task_failed",
+                task_id=record.task_id,
+                step_id=step_id,
+                error=record.last_error,
+            )
+
+    async def _request_approval(
+        self,
+        *,
+        record: TaskRecord,
+        step_id: str,
+        safe_action: dict[str, Any],
+        decision: SafetyDecision,
+        timeout_seconds: float,
+    ) -> tuple[bool, str | None]:
+        loop = asyncio.get_running_loop()
+        approval_id = str(uuid.uuid4())
+        future: asyncio.Future[tuple[bool, str | None]] = loop.create_future()
+        pending = PendingApproval(
+            approval_id=approval_id,
+            task_id=record.task_id,
+            step_id=step_id,
+            action=safe_action,
+            risk_level=decision.risk_level,
+            category=decision.category,
+            reasons=list(decision.reasons),
+            created_at=utc_now_iso(),
+            future=future,
+        )
+        record.pending_approval = pending
+        record.state = "awaiting_approval"
+        record.updated_at = utc_now_iso()
+
+        await self._emit(
+            "approval_required",
+            task_id=record.task_id,
+            step_id=step_id,
+            approval=pending.to_public_dict(),
+        )
+
+        try:
+            approved, reason = await asyncio.wait_for(future, timeout=timeout_seconds)
+        except TimeoutError:
+            approved, reason = False, f"Approval timed out after {timeout_seconds}s."
+        finally:
+            record.pending_approval = None
+            if not self._is_interrupted(record):
+                record.state = "running"
+                record.updated_at = utc_now_iso()
+
+        await self._emit(
+            "approval_resolved",
+            task_id=record.task_id,
+            step_id=step_id,
+            approval_id=approval_id,
+            approved=approved,
+            reason=reason,
+        )
+        return approved, reason
+
+    async def _emit(self, event_type: str, **fields: Any) -> None:
+        payload: dict[str, Any] = {
+            "type": event_type,
+            "timestamp": utc_now_iso(),
+            **fields,
+        }
+        await self._broadcaster(payload)
