@@ -1,20 +1,28 @@
-"""Non-blocking Agent-S task orchestrator with pause, cancel, emergency stop, and approvals."""
+"""Non-blocking Agent-S task orchestrator with persistent emergency stop,
+interruptible dispatch, bound approvals, secret scrubbing, and bounded retention.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
+import secrets
+import threading
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from robbie.core.runtime import utc_now_iso
+from robbie.core.security import REDACTED_MARKER, SecretScrubber, get_secret_scrubber
 from robbie.providers.config import AgentRuntimeConfig
 from robbie.tools.actions import DoneAction, FailAction, RobbieAction, TypeTextAction
 from robbie.tools.safety import ActionSafetyPolicy, SafetyDecision
 from robbie.tools.windows import (
     ActionExecutionResult,
+    ActionInterruptedError,
     ScreenCaptureProtocol,
     WindowsActionDispatcher,
     WindowsScreenCapture,
@@ -40,6 +48,20 @@ TERMINAL_TASK_STATES: frozenset[str] = frozenset(
     {"completed", "failed", "cancelled", "emergency_stopped"}
 )
 
+DEFAULT_MAX_RETAINED_TASKS = 100
+
+
+class EmergencyStopActiveError(RuntimeError):
+    """Raised when a new task is requested while the emergency-stop latch is engaged."""
+
+
+class ApprovalConflictError(RuntimeError):
+    """Raised when attempting to resolve an already-resolved, expired, or cancelled approval."""
+
+
+class ApprovalMismatchError(ValueError):
+    """Raised when an approval confirmation does not match the pending step_id or action_digest."""
+
 
 class StepPredictorProtocol(Protocol):
     def reset(self) -> None: ...
@@ -53,18 +75,46 @@ class StepPredictorProtocol(Protocol):
 
 
 class ActionDispatcherProtocol(Protocol):
-    def execute(self, action: RobbieAction) -> ActionExecutionResult: ...
+    def execute(
+        self,
+        action: RobbieAction,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> ActionExecutionResult: ...
 
 
 EventBroadcaster = Callable[[dict[str, Any]], Awaitable[None]]
 
 
-def _sanitize_action_for_event(action: RobbieAction, category: str) -> dict[str, Any]:
-    """Serialize action metadata for status/WebSocket events without leaking secrets."""
+def compute_action_digest(task_id: str, step_id: str, action: RobbieAction) -> str:
+    """Compute a SHA-256 digest binding an approval to the exact task, step, and action."""
+    canonical = json.dumps(
+        {
+            "task_id": task_id,
+            "step_id": step_id,
+            "action": action.model_dump(mode="json"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _sanitize_action_for_event(
+    action: RobbieAction,
+    category: str,
+    scrubber: SecretScrubber | None = None,
+) -> dict[str, Any]:
+    """Serialize action metadata safely for events/approvals without ever exposing typed text."""
+    active_scrubber = scrubber or get_secret_scrubber()
     payload = action.model_dump()
-    if isinstance(action, TypeTextAction) and category == "credential_access":
-        payload["text"] = "[REDACTED]"
-    return payload
+    if isinstance(action, TypeTextAction):
+        raw_text = action.text
+        payload["text"] = REDACTED_MARKER
+        payload["text_length"] = len(raw_text)
+        payload["has_non_ascii"] = any(ord(ch) > 127 for ch in raw_text)
+        payload["action_category"] = category
+    return active_scrubber.scrub_value(payload)  # type: ignore[no-any-return]
 
 
 @dataclass
@@ -72,6 +122,7 @@ class PendingApproval:
     approval_id: str
     task_id: str
     step_id: str
+    action_digest: str
     action: dict[str, Any]
     risk_level: str
     category: str
@@ -84,6 +135,7 @@ class PendingApproval:
             "approval_id": self.approval_id,
             "task_id": self.task_id,
             "step_id": self.step_id,
+            "action_digest": self.action_digest,
             "action": self.action,
             "risk_level": self.risk_level,
             "category": self.category,
@@ -104,7 +156,9 @@ class TaskRecord:
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
     pending_approval: PendingApproval | None = None
+    resolved_approval_ids: set[str] = field(default_factory=set, repr=False)
     resume_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     cancel_requested: bool = False
     emergency_stop_requested: bool = False
     bg_task: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -144,19 +198,27 @@ class TaskRunner:
         *,
         broadcaster: EventBroadcaster,
         safety_policy: ActionSafetyPolicy | None = None,
+        scrubber: SecretScrubber | None = None,
         adapter_factory: Callable[[AgentRuntimeConfig], StepPredictorProtocol] | None = None,
         dispatcher_factory: Callable[[AgentRuntimeConfig], ActionDispatcherProtocol] | None = None,
         screen_capture_factory: Callable[[], ScreenCaptureProtocol] | None = None,
+        max_retained_tasks: int = DEFAULT_MAX_RETAINED_TASKS,
     ) -> None:
         self._broadcaster = broadcaster
         self._safety_policy = safety_policy or ActionSafetyPolicy()
+        self._scrubber = scrubber or get_secret_scrubber()
         self._adapter_factory = adapter_factory or _default_adapter_factory
         self._dispatcher_factory = dispatcher_factory or (
             lambda cfg: WindowsActionDispatcher(dry_run=cfg.dry_run)
         )
         self._screen_capture_factory = screen_capture_factory or (lambda: WindowsScreenCapture())
+        self._max_retained_tasks = max(1, max_retained_tasks)
         self._tasks: dict[str, TaskRecord] = {}
         self._emergency_stopped = False
+
+    @property
+    def is_emergency_stopped(self) -> bool:
+        return self._emergency_stopped
 
     def get_task(self, task_id: str) -> TaskRecord | None:
         return self._tasks.get(task_id)
@@ -164,30 +226,56 @@ class TaskRunner:
     def list_tasks(self) -> list[dict[str, Any]]:
         return [record.to_public_dict() for record in self._tasks.values()]
 
+    def _register_config_secrets(self, config: AgentRuntimeConfig) -> None:
+        if config.worker.api_key is not None:
+            self._scrubber.register(config.worker.api_key.get_secret_value())
+        if config.grounding.api_key is not None:
+            self._scrubber.register(config.grounding.api_key.get_secret_value())
+
+    def _evict_completed_tasks(self) -> None:
+        """Evict oldest terminal tasks without ever removing active or pending-approval tasks."""
+        if len(self._tasks) <= self._max_retained_tasks:
+            return
+        for task_id in list(self._tasks.keys()):
+            if len(self._tasks) <= self._max_retained_tasks:
+                break
+            candidate = self._tasks[task_id]
+            if candidate.state in TERMINAL_TASK_STATES and candidate.pending_approval is None:
+                del self._tasks[task_id]
+
     async def start_task(
         self,
         instruction: str,
         config: AgentRuntimeConfig,
     ) -> TaskRecord:
-        self._emergency_stopped = False
+        # Persistent latch: never clear emergency stop automatically when starting a task.
+        if self._emergency_stopped:
+            raise EmergencyStopActiveError(
+                "Emergency stop is active. Explicitly reset emergency stop before starting tasks."
+            )
+
+        self._register_config_secrets(config)
+        self._evict_completed_tasks()
+
         task_id = str(uuid.uuid4())
+        safe_instruction = self._scrubber.scrub_text(instruction)
         record = TaskRecord(
             task_id=task_id,
-            instruction=instruction,
+            instruction=safe_instruction,
             state="pending",
             max_steps=config.max_steps,
         )
         self._tasks[task_id] = record
         record.bg_task = asyncio.create_task(
-            self._run_task(record, config),
+            self._run_task(record, config, raw_instruction=instruction),
             name=f"robbie-task-{task_id[:8]}",
         )
         return record
 
     async def pause_task(self, task_id: str) -> TaskRecord:
         record = self._require_task(task_id)
-        if record.state in TERMINAL_TASK_STATES:
-            raise ValueError(f"Cannot pause task in terminal state '{record.state}'.")
+        if record.state in TERMINAL_TASK_STATES or self._is_interrupted(record):
+            raise ValueError(f"Cannot pause task in state '{record.state}'.")
         record.resume_event.clear()
         if record.state != "awaiting_approval":
             record.state = "paused"
@@ -197,8 +285,8 @@ class TaskRunner:
 
     async def resume_task(self, task_id: str) -> TaskRecord:
         record = self._require_task(task_id)
-        if record.state in TERMINAL_TASK_STATES:
-            raise ValueError(f"Cannot resume task in terminal state '{record.state}'.")
+        if record.state in TERMINAL_TASK_STATES or self._is_interrupted(record):
+            raise ValueError(f"Cannot resume interrupted or terminal task '{record.state}'.")
         record.resume_event.set()
         if record.state == "paused":
             record.state = "running"
@@ -206,14 +294,25 @@ class TaskRunner:
         await self._emit("task_resumed", task_id=task_id, step_id=record.last_step_id)
         return record
 
+    def _invalidate_pending_approval(self, record: TaskRecord, reason: str) -> None:
+        pending = record.pending_approval
+        if pending is None:
+            return
+        record.resolved_approval_ids.add(pending.approval_id)
+        record.pending_approval = None
+        if not pending.future.done():
+            pending.future.set_result((False, reason))
+
     async def cancel_task(self, task_id: str) -> TaskRecord:
         record = self._require_task(task_id)
         if record.state in TERMINAL_TASK_STATES:
             return record
         record.cancel_requested = True
+        record.stop_event.set()
+        record.state = "cancelled"
+        record.updated_at = utc_now_iso()
         record.resume_event.set()
-        if record.pending_approval and not record.pending_approval.future.done():
-            record.pending_approval.future.set_result((False, "Task cancelled."))
+        self._invalidate_pending_approval(record, "Task cancelled.")
         return record
 
     async def resolve_approval(
@@ -222,34 +321,67 @@ class TaskRunner:
         approval_id: str,
         *,
         approved: bool,
+        step_id: str,
+        action_digest: str,
         reason: str | None = None,
     ) -> TaskRecord:
         record = self._require_task(task_id)
+
+        if approval_id in record.resolved_approval_ids:
+            raise ApprovalConflictError(
+                f"Approval '{approval_id}' was already resolved, expired, or cancelled."
+            )
+
+        if record.state in TERMINAL_TASK_STATES or self._is_interrupted(record):
+            raise ApprovalConflictError(
+                f"Cannot resolve approval for task in state '{record.state}'."
+            )
+
         pending = record.pending_approval
         if pending is None or pending.approval_id != approval_id:
             raise KeyError(f"No pending approval '{approval_id}' for task '{task_id}'.")
-        if not pending.future.done():
-            pending.future.set_result((approved, reason))
+
+        if pending.future.done():
+            record.resolved_approval_ids.add(approval_id)
+            raise ApprovalConflictError(f"Approval '{approval_id}' is no longer active.")
+
+        if pending.step_id != step_id or not secrets.compare_digest(
+            pending.action_digest, action_digest
+        ):
+            raise ApprovalMismatchError(
+                "Approval step_id or action_digest does not match the pending action."
+            )
+
+        record.resolved_approval_ids.add(approval_id)
+        record.pending_approval = None
+        pending.future.set_result((approved, reason))
         return record
 
     async def emergency_stop(self) -> list[str]:
-        """Immediately halt all active tasks and reject pending approvals."""
+        """Engage persistent emergency stop, abort in-flight actions, and invalidate approvals."""
         self._emergency_stopped = True
         affected: list[str] = []
         for record in self._tasks.values():
-            if record.state not in TERMINAL_TASK_STATES:
+            if record.state not in TERMINAL_TASK_STATES or record.pending_approval is not None:
                 record.emergency_stop_requested = True
                 record.cancel_requested = True
+                record.stop_event.set()
+                record.state = "emergency_stopped"
+                record.updated_at = utc_now_iso()
                 record.resume_event.set()
-                if record.pending_approval and not record.pending_approval.future.done():
-                    record.pending_approval.future.set_result((False, "Emergency stop activated."))
+                self._invalidate_pending_approval(record, "Emergency stop activated.")
                 affected.append(record.task_id)
 
         await self._emit("emergency_stop", affected_task_ids=affected)
         return affected
 
+    async def reset_emergency_stop(self) -> None:
+        """Explicit operator reset required before accepting new tasks after emergency stop."""
+        self._emergency_stopped = False
+        await self._emit("emergency_stop_reset", emergency_stopped=False)
+
     async def shutdown(self) -> None:
-        """Cancel all running tasks cleanly during backend shutdown."""
+        """Halt all running tasks cleanly during backend shutdown."""
         await self.emergency_stop()
         bg_tasks = [
             record.bg_task
@@ -266,9 +398,15 @@ class TaskRunner:
         return record
 
     def _is_interrupted(self, record: TaskRecord) -> bool:
-        return record.cancel_requested or record.emergency_stop_requested or self._emergency_stopped
+        return (
+            record.cancel_requested
+            or record.emergency_stop_requested
+            or record.stop_event.is_set()
+            or self._emergency_stopped
+        )
 
     async def _finalize_interruption(self, record: TaskRecord, step_id: str | None) -> None:
+        self._invalidate_pending_approval(record, "Task interrupted.")
         if record.emergency_stop_requested or self._emergency_stopped:
             record.state = "emergency_stopped"
             record.updated_at = utc_now_iso()
@@ -287,7 +425,13 @@ class TaskRunner:
                 record.state = "running"
                 record.updated_at = utc_now_iso()
 
-    async def _run_task(self, record: TaskRecord, config: AgentRuntimeConfig) -> None:
+    async def _run_task(
+        self,
+        record: TaskRecord,
+        config: AgentRuntimeConfig,
+        *,
+        raw_instruction: str,
+    ) -> None:
         step_id: str | None = None
         try:
             record.state = "running"
@@ -332,7 +476,7 @@ class TaskRunner:
                 prediction = await asyncio.wait_for(
                     asyncio.to_thread(
                         adapter.predict_step,
-                        record.instruction,
+                        raw_instruction,
                         screenshot,
                         cancel_check=lambda: self._is_interrupted(record),
                     ),
@@ -346,9 +490,13 @@ class TaskRunner:
 
                 decision: SafetyDecision = self._safety_policy.evaluate(
                     prediction.action,
-                    task_instruction=record.instruction,
+                    task_instruction=raw_instruction,
                 )
-                safe_action = _sanitize_action_for_event(prediction.action, decision.category)
+                safe_action = _sanitize_action_for_event(
+                    prediction.action,
+                    decision.category,
+                    self._scrubber,
+                )
 
                 await self._emit(
                     "step_planned",
@@ -384,7 +532,9 @@ class TaskRunner:
                     return
 
                 if not decision.allowed:
-                    reason = "; ".join(decision.reasons) or "Action blocked by safety policy."
+                    reason = self._scrubber.scrub_text(
+                        "; ".join(decision.reasons) or "Action blocked by safety policy."
+                    )
                     await self._emit(
                         "action_rejected",
                         task_id=record.task_id,
@@ -408,6 +558,7 @@ class TaskRunner:
                     approved, approval_reason = await self._request_approval(
                         record=record,
                         step_id=step_id,
+                        action=prediction.action,
                         safe_action=safe_action,
                         decision=decision,
                         timeout_seconds=config.approval_timeout_seconds,
@@ -416,7 +567,9 @@ class TaskRunner:
                         await self._finalize_interruption(record, step_id)
                         return
                     if not approved:
-                        deny_reason = approval_reason or "Sensitive action was denied by user."
+                        deny_reason = self._scrubber.scrub_text(
+                            approval_reason or "Sensitive action was denied by user."
+                        )
                         await self._emit(
                             "action_rejected",
                             task_id=record.task_id,
@@ -442,7 +595,11 @@ class TaskRunner:
                     return
 
                 exec_result = await asyncio.wait_for(
-                    asyncio.to_thread(dispatcher.execute, prediction.action),
+                    asyncio.to_thread(
+                        dispatcher.execute,
+                        prediction.action,
+                        stop_event=record.stop_event,
+                    ),
                     timeout=config.step_timeout_seconds,
                 )
                 await self._emit(
@@ -451,7 +608,7 @@ class TaskRunner:
                     step_id=step_id,
                     action=safe_action,
                     result_status=exec_result.status,
-                    detail=exec_result.detail,
+                    detail=self._scrubber.scrub_text(exec_result.detail),
                 )
 
             record.state = "failed"
@@ -465,6 +622,8 @@ class TaskRunner:
                 step_id=step_id,
                 error=record.last_error,
             )
+        except ActionInterruptedError:
+            await self._finalize_interruption(record, step_id)
         except TimeoutError:
             record.state = "failed"
             record.last_error = f"Task timed out after {config.step_timeout_seconds}s."
@@ -477,40 +636,47 @@ class TaskRunner:
             )
         except asyncio.CancelledError:
             record.cancel_requested = True
+            record.stop_event.set()
             await self._finalize_interruption(record, step_id)
             raise
         except Exception as exc:
-            logger.exception("Task %s failed with unexpected error.", record.task_id)
+            safe_error = self._scrubber.scrub_text(str(exc) or type(exc).__name__)
+            logger.error("Task %s failed: %s", record.task_id, safe_error)
             record.state = "failed"
-            record.last_error = str(exc) or type(exc).__name__
+            record.last_error = safe_error
             record.updated_at = utc_now_iso()
             await self._emit(
                 "task_failed",
                 task_id=record.task_id,
                 step_id=step_id,
-                error=record.last_error,
+                error=safe_error,
             )
+        finally:
+            self._evict_completed_tasks()
 
     async def _request_approval(
         self,
         *,
         record: TaskRecord,
         step_id: str,
+        action: RobbieAction,
         safe_action: dict[str, Any],
         decision: SafetyDecision,
         timeout_seconds: float,
     ) -> tuple[bool, str | None]:
         loop = asyncio.get_running_loop()
         approval_id = str(uuid.uuid4())
+        action_digest = compute_action_digest(record.task_id, step_id, action)
         future: asyncio.Future[tuple[bool, str | None]] = loop.create_future()
         pending = PendingApproval(
             approval_id=approval_id,
             task_id=record.task_id,
             step_id=step_id,
+            action_digest=action_digest,
             action=safe_action,
             risk_level=decision.risk_level,
             category=decision.category,
-            reasons=list(decision.reasons),
+            reasons=[self._scrubber.scrub_text(r) for r in decision.reasons],
             created_at=utc_now_iso(),
             future=future,
         )
@@ -528,10 +694,13 @@ class TaskRunner:
         try:
             approved, reason = await asyncio.wait_for(future, timeout=timeout_seconds)
         except TimeoutError:
+            record.resolved_approval_ids.add(approval_id)
             approved, reason = False, f"Approval timed out after {timeout_seconds}s."
         finally:
-            record.pending_approval = None
-            if not self._is_interrupted(record):
+            record.resolved_approval_ids.add(approval_id)
+            if record.pending_approval is pending:
+                record.pending_approval = None
+            if not self._is_interrupted(record) and record.state == "awaiting_approval":
                 record.state = "running"
                 record.updated_at = utc_now_iso()
 
@@ -540,8 +709,9 @@ class TaskRunner:
             task_id=record.task_id,
             step_id=step_id,
             approval_id=approval_id,
+            action_digest=action_digest,
             approved=approved,
-            reason=reason,
+            reason=self._scrubber.scrub_text(reason) if reason else None,
         )
         return approved, reason
 
@@ -551,4 +721,5 @@ class TaskRunner:
             "timestamp": utc_now_iso(),
             **fields,
         }
-        await self._broadcaster(payload)
+        scrubbed_payload = self._scrubber.scrub_value(payload)
+        await self._broadcaster(scrubbed_payload)

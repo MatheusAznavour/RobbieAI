@@ -71,11 +71,13 @@ class CreateTaskRequest(BaseModel):
 
 
 class ApprovalDecisionRequest(BaseModel):
-    """User approval or denial payload for a pending sensitive action."""
+    """User approval or denial bound strictly to step_id and action_digest."""
 
     model_config = ConfigDict(extra="forbid")
 
     approved: bool
+    step_id: str = Field(min_length=1, max_length=256)
+    action_digest: str = Field(min_length=64, max_length=64)
     reason: str | None = Field(default=None, max_length=500)
 
 
@@ -83,6 +85,7 @@ class PendingApprovalResponse(BaseModel):
     approval_id: str
     task_id: str
     step_id: str
+    action_digest: str
     action: dict[str, Any]
     risk_level: str
     category: str
@@ -106,4 +109,10 @@ class TaskStatusResponse(BaseModel):
 class EmergencyStopResponse(BaseModel):
     status: Literal["emergency_stopped"] = "emergency_stopped"
     affected_task_ids: list[str]
+    timestamp: str
+
+
+class EmergencyStopResetResponse(BaseModel):
+    status: Literal["ready"] = "ready"
+    emergency_stopped: Literal[False] = False
     timestamp: str

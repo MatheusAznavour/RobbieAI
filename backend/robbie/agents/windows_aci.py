@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
+import os
 import re
-from typing import Any
+from typing import Any, Literal
 
 import pytesseract
 from gui_agents.s3.agents.grounding import OSWorldACI, agent_action
@@ -70,7 +72,7 @@ class RobbieWindowsACI(OSWorldACI):
     """Robbie-owned Windows ACI extending Agent-S S3 OSWorldACI.
 
     Key safety and Windows-compatibility invariants:
-    - `env` is unconditionally forced to `None` (disabling Agent-S LocalEnv / CodeAgent).
+    - `env` is unconditionally forced to `None` and `self.code_agent` is cleared to `None`.
     - Every `@agent_action` method returns a validated `RobbieAction` Pydantic model
       instead of raw Python/PyAutoGUI code strings intended for `exec()`.
     - Eliminates Linux-only fallbacks (`wmctrl`, `apt-get xclip`, LibreOffice `uno`).
@@ -102,12 +104,21 @@ class RobbieWindowsACI(OSWorldACI):
             width=self.display_info.primary_width,
             height=self.display_info.primary_height,
         )
+        # Clear unused upstream CodeAgent instance as defense-in-depth.
+        self.code_agent = None
 
     @property
     def allowed_action_methods(self) -> frozenset[str]:
         if self.tesseract_status.available:
             return BASE_ALLOWED_ACTIONS | frozenset({"highlight_text_span"})
         return BASE_ALLOWED_ACTIONS
+
+    @property
+    def allowed_method_signatures(self) -> dict[str, inspect.Signature]:
+        """Return bound inspect.Signature objects for all allowed action methods."""
+        return {
+            name: inspect.signature(getattr(self, name)) for name in self.allowed_action_methods
+        }
 
     def _clamp_coordinates(self, coords: list[int]) -> tuple[int, int]:
         max_x = max(0, self.width - 1)
@@ -236,8 +247,15 @@ class RobbieWindowsACI(OSWorldACI):
 
     @agent_action
     def open(self, app_or_filename: str) -> RobbieAction:
-        """Open a Windows application or file by name."""
-        return OpenApplicationAction(target=app_or_filename)
+        """Open a Windows application or safe document file by structured target."""
+        cleaned = app_or_filename.strip()
+        _, ext = os.path.splitext(cleaned.lower())
+        target_kind: Literal["application", "file"] = (
+            "file"
+            if ("\\" in cleaned or "/" in cleaned or (ext and ext != ".exe"))
+            else "application"
+        )
+        return OpenApplicationAction(target=cleaned, target_kind=target_kind)
 
     @agent_action
     def type(
@@ -264,10 +282,11 @@ class RobbieWindowsACI(OSWorldACI):
 
     @agent_action
     def save_to_knowledge(self, text: list[str]) -> RobbieAction:
-        """Store short task notes in the session knowledge buffer."""
-        notes = [str(item) for item in text]
-        self.notes.extend(notes)
-        return SaveToKnowledgeAction(notes=notes)
+        """Store short string task notes in the session knowledge buffer."""
+        if not isinstance(text, list) or not all(isinstance(item, str) for item in text):
+            raise ValueError("save_to_knowledge requires a flat list of strings.")
+        self.notes.extend(text)
+        return SaveToKnowledgeAction(notes=list(text))
 
     @agent_action
     def drag_and_drop(

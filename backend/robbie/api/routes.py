@@ -16,10 +16,16 @@ from fastapi import (
 )
 
 import robbie
-from robbie.agents.runner import TaskRunner
+from robbie.agents.runner import (
+    ApprovalConflictError,
+    ApprovalMismatchError,
+    EmergencyStopActiveError,
+    TaskRunner,
+)
 from robbie.api.schemas import (
     ApprovalDecisionRequest,
     CreateTaskRequest,
+    EmergencyStopResetResponse,
     EmergencyStopResponse,
     ErrorEvent,
     HealthResponse,
@@ -86,9 +92,12 @@ async def create_task(
     payload: CreateTaskRequest,
     request: Request,
 ) -> TaskStatusResponse:
-    """Start a new non-blocking Agent-S S3 task."""
+    """Start a new non-blocking Agent-S S3 task (rejected if emergency stop is active)."""
     runner = _require_task_runner(request)
-    record = await runner.start_task(payload.instruction, payload.config)
+    try:
+        record = await runner.start_task(payload.instruction, payload.config)
+    except EmergencyStopActiveError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return TaskStatusResponse(**record.to_public_dict())
 
 
@@ -140,7 +149,7 @@ async def pause_task(task_id: str, request: Request) -> TaskStatusResponse:
     dependencies=[Depends(require_http_auth)],
 )
 async def resume_task(task_id: str, request: Request) -> TaskStatusResponse:
-    """Resume a paused task."""
+    """Resume a paused task (rejected if interrupted or emergency-stopped)."""
     runner = _require_task_runner(request)
     try:
         record = await runner.resume_task(task_id)
@@ -157,7 +166,7 @@ async def resume_task(task_id: str, request: Request) -> TaskStatusResponse:
     dependencies=[Depends(require_http_auth)],
 )
 async def cancel_task(task_id: str, request: Request) -> TaskStatusResponse:
-    """Cooperatively cancel an active or waiting task."""
+    """Cooperatively cancel an active or waiting task and invalidate pending approvals."""
     runner = _require_task_runner(request)
     try:
         record = await runner.cancel_task(task_id)
@@ -177,17 +186,21 @@ async def resolve_approval(
     payload: ApprovalDecisionRequest,
     request: Request,
 ) -> TaskStatusResponse:
-    """Approve or deny a pending sensitive action."""
+    """Approve or deny a pending sensitive action bound to task_id, step_id, and action_digest."""
     runner = _require_task_runner(request)
     try:
         record = await runner.resolve_approval(
             task_id,
             approval_id,
             approved=payload.approved,
+            step_id=payload.step_id,
+            action_digest=payload.action_digest,
             reason=payload.reason,
         )
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except (ApprovalConflictError, ApprovalMismatchError) as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     return TaskStatusResponse(**record.to_public_dict())
 
 
@@ -197,10 +210,22 @@ async def resolve_approval(
     dependencies=[Depends(require_http_auth)],
 )
 async def emergency_stop(request: Request) -> EmergencyStopResponse:
-    """Immediately halt all active tasks and reject pending approvals."""
+    """Engage persistent emergency stop and halt all active tasks immediately."""
     runner = _require_task_runner(request)
     affected = await runner.emergency_stop()
     return EmergencyStopResponse(affected_task_ids=affected, timestamp=utc_now_iso())
+
+
+@router.post(
+    "/emergency-stop/reset",
+    response_model=EmergencyStopResetResponse,
+    dependencies=[Depends(require_http_auth)],
+)
+async def reset_emergency_stop(request: Request) -> EmergencyStopResetResponse:
+    """Explicitly reset the persistent emergency-stop latch to allow new tasks."""
+    runner = _require_task_runner(request)
+    await runner.reset_emergency_stop()
+    return EmergencyStopResetResponse(timestamp=utc_now_iso())
 
 
 @router.websocket("/ws/status")

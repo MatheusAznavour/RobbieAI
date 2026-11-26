@@ -30,7 +30,7 @@ WS_HEADERS = {"Authorization": f"Bearer {TEST_TOKEN}", "Origin": TRUSTED_ORIGIN}
 
 
 def _task_request_payload(
-    instruction: str = "Click the Help button",
+    instruction: str = "Open the Help menu tab",
     *,
     max_steps: int = 5,
     step_timeout_seconds: float = 5.0,
@@ -108,7 +108,12 @@ class RecordingDispatcher:
     def __init__(self) -> None:
         self.executed: list[RobbieAction] = []
 
-    def execute(self, action: RobbieAction) -> ActionExecutionResult:
+    def execute(
+        self,
+        action: RobbieAction,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> ActionExecutionResult:
         self.executed.append(action)
         return ActionExecutionResult(kind=action.kind, status="ok", detail="mocked")
 
@@ -162,12 +167,13 @@ def test_task_endpoints_require_authentication() -> None:
         assert client.post("/tasks", json=_task_request_payload()).status_code == 401
         assert client.get("/tasks").status_code == 401
         assert client.post("/emergency-stop").status_code == 401
+        assert client.post("/emergency-stop/reset").status_code == 401
 
 
 def test_task_execution_streams_ws_events_non_blocking_and_without_leaking_secrets() -> None:
     adapter = ScriptedAdapter(
         [
-            ClickAction(x=100, y=100, element_description="Click Help menu"),
+            ClickAction(x=100, y=100, element_description="Click the Help menu tab"),
             DoneAction(),
         ],
         delay_seconds=0.25,
@@ -222,11 +228,11 @@ def test_task_execution_streams_ws_events_non_blocking_and_without_leaking_secre
                 assert TEST_TOKEN not in serialized
 
 
-def test_sensitive_action_requires_approval_approve_and_deny_paths() -> None:
-    # 1. Approved sensitive action executes after explicit approval
+def test_sensitive_action_requires_bound_approval_approve_and_deny_paths() -> None:
+    # 1. Approved non-allowlisted document open executes after bound approval
     approve_adapter = ScriptedAdapter(
         [
-            OpenApplicationAction(target="powershell.exe"),
+            OpenApplicationAction(target="Downloads\\invoice.docx", target_kind="file"),
             DoneAction(),
         ]
     )
@@ -237,20 +243,25 @@ def test_sensitive_action_requires_approval_approve_and_deny_paths() -> None:
         resp = client.post(
             "/tasks",
             headers=AUTH_HEADERS,
-            json=_task_request_payload("Open PowerShell"),
+            json=_task_request_payload("Inspect invoice document"),
         )
         task_id = resp.json()["task_id"]
 
         waiting = _poll_task_state(client, task_id, {"awaiting_approval"})
         approval = waiting["pending_approval"]
         assert approval is not None
-        assert approval["risk_level"] == "critical"
+        assert len(approval["action_digest"]) == 64
         assert len(approve_dispatcher.executed) == 0
 
         resolve_resp = client.post(
             f"/tasks/{task_id}/approvals/{approval['approval_id']}",
             headers=AUTH_HEADERS,
-            json={"approved": True, "reason": "User confirmed"},
+            json={
+                "approved": True,
+                "step_id": approval["step_id"],
+                "action_digest": approval["action_digest"],
+                "reason": "User confirmed",
+            },
         )
         assert resolve_resp.status_code == 200
 
@@ -258,7 +269,7 @@ def test_sensitive_action_requires_approval_approve_and_deny_paths() -> None:
         assert completed["state"] == "completed"
         assert len(approve_dispatcher.executed) == 1
 
-    # 2. Denied credential action is NOT executed and redacts typed secret text
+    # 2. Denied credential action is NOT executed and redacts typed text by default
     deny_adapter = ScriptedAdapter(
         [
             TypeTextAction(
@@ -284,11 +295,17 @@ def test_sensitive_action_requires_approval_approve_and_deny_paths() -> None:
         assert approval is not None
         assert approval["category"] == "credential_access"
         assert approval["action"]["text"] == "[REDACTED]"
+        assert approval["action"]["text_length"] == len("my-raw-password-value")
 
         client.post(
             f"/tasks/{task_id}/approvals/{approval['approval_id']}",
             headers=AUTH_HEADERS,
-            json={"approved": False, "reason": "User denied"},
+            json={
+                "approved": False,
+                "step_id": approval["step_id"],
+                "action_digest": approval["action_digest"],
+                "reason": "User denied",
+            },
         )
         cancelled = _poll_task_state(client, task_id, {"cancelled"})
         assert cancelled["state"] == "cancelled"
@@ -300,7 +317,7 @@ def test_pause_resume_cancel_and_emergency_stop() -> None:
     gate = threading.Event()
     pause_adapter = ScriptedAdapter(
         [
-            ClickAction(x=10, y=10, element_description="Step 1 button"),
+            ClickAction(x=10, y=10, element_description="Focus the Help menu tab"),
             DoneAction(),
         ],
         gate=gate,
@@ -312,7 +329,7 @@ def test_pause_resume_cancel_and_emergency_stop() -> None:
         task_id = client.post(
             "/tasks",
             headers=AUTH_HEADERS,
-            json=_task_request_payload("Two step task"),
+            json=_task_request_payload("View Help menu"),
         ).json()["task_id"]
 
         assert client.post(f"/tasks/{task_id}/pause", headers=AUTH_HEADERS).status_code == 200
@@ -327,7 +344,9 @@ def test_pause_resume_cancel_and_emergency_stop() -> None:
         assert len(pause_dispatcher.executed) == 1
 
     # 2. Cancel during awaiting approval
-    cancel_adapter = ScriptedAdapter([OpenApplicationAction(target="cmd.exe"), DoneAction()])
+    cancel_adapter = ScriptedAdapter(
+        [OpenApplicationAction(target="Downloads\\report.pdf", target_kind="file"), DoneAction()]
+    )
     cancel_dispatcher = RecordingDispatcher()
     app2 = _make_app_with_mocks(cancel_adapter, cancel_dispatcher)
 
@@ -335,7 +354,7 @@ def test_pause_resume_cancel_and_emergency_stop() -> None:
         task_id = client.post(
             "/tasks",
             headers=AUTH_HEADERS,
-            json=_task_request_payload("Open cmd"),
+            json=_task_request_payload("View report"),
         ).json()["task_id"]
         _poll_task_state(client, task_id, {"awaiting_approval"})
 
@@ -345,7 +364,9 @@ def test_pause_resume_cancel_and_emergency_stop() -> None:
         assert cancel_dispatcher.executed == []
 
     # 3. Emergency stop halts waiting task immediately
-    stop_adapter = ScriptedAdapter([OpenApplicationAction(target="regedit.exe"), DoneAction()])
+    stop_adapter = ScriptedAdapter(
+        [OpenApplicationAction(target="Downloads\\report.pdf", target_kind="file"), DoneAction()]
+    )
     stop_dispatcher = RecordingDispatcher()
     app3 = _make_app_with_mocks(stop_adapter, stop_dispatcher)
 
@@ -353,7 +374,7 @@ def test_pause_resume_cancel_and_emergency_stop() -> None:
         task_id = client.post(
             "/tasks",
             headers=AUTH_HEADERS,
-            json=_task_request_payload("Open regedit"),
+            json=_task_request_payload("View report"),
         ).json()["task_id"]
         _poll_task_state(client, task_id, {"awaiting_approval"})
 
@@ -367,7 +388,6 @@ def test_pause_resume_cancel_and_emergency_stop() -> None:
 
 
 def test_task_failure_and_step_timeout_handling() -> None:
-    # 1. Agent error transitions cleanly to failed
     err_adapter = ScriptedAdapter([RuntimeError("Upstream VLM returned HTTP 503")])
     app = _make_app_with_mocks(err_adapter, RecordingDispatcher())
     with TestClient(app) as client:
@@ -380,7 +400,6 @@ def test_task_failure_and_step_timeout_handling() -> None:
         assert failed["state"] == "failed"
         assert "HTTP 503" in (failed["last_error"] or "")
 
-    # 2. Step timeout transitions cleanly to failed
     slow_adapter = ScriptedAdapter([DoneAction()], delay_seconds=0.6)
     app2 = _make_app_with_mocks(slow_adapter, RecordingDispatcher())
     with TestClient(app2) as client:

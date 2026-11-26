@@ -88,7 +88,7 @@ def test_action_models_enforce_strict_schema_validation() -> None:
         ClickAction(x=10, y=10, element_description="Ok", extra_field=True)  # type: ignore[call-arg]
 
 
-def test_safety_policy_requires_approval_for_sensitive_categories() -> None:
+def test_safety_policy_blocks_shells_and_requires_approval_for_sensitive_categories() -> None:
     policy = ActionSafetyPolicy()
 
     # File deletion
@@ -103,10 +103,9 @@ def test_safety_policy_requires_approval_for_sensitive_categories() -> None:
     assert del_click.requires_approval is True
     assert del_click.category == "file_deletion"
 
-    # Software installation & shell execution
+    # Command interpreters are hard-blocked (not even approvable)
     open_ps = policy.evaluate(OpenApplicationAction(target="powershell.exe"))
-    assert open_ps.allowed is True
-    assert open_ps.requires_approval is True
+    assert open_ps.allowed is False
     assert open_ps.risk_level == "critical"
 
     install_cmd = policy.evaluate(TypeTextAction(text="winget install SomeTool", enter=True))
@@ -142,7 +141,7 @@ def test_safety_policy_requires_approval_for_sensitive_categories() -> None:
     assert blocked.allowed is False
     assert blocked.risk_level == "critical"
 
-    # Benign GUI interaction does not require approval
+    # Strictly read-only navigation GUI interaction does not require approval
     benign = policy.evaluate(
         ClickAction(x=200, y=200, element_description="Click the Help menu tab")
     )

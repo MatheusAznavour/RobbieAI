@@ -87,6 +87,15 @@ class FakeClipboard:
         self.history.append(text)
 
 
+class FakeAppLauncher:
+    def __init__(self) -> None:
+        self.launched: list[tuple[str, str]] = []
+
+    def launch(self, target: str, target_kind: str = "application") -> str:
+        self.launched.append((target, target_kind))
+        return f"Launched {target}"
+
+
 class FakeWindowManager:
     def __init__(self, windows: list[WindowEntry], *, deny_uac: bool = False) -> None:
         self._windows = windows
@@ -134,11 +143,14 @@ def _make_aci(tesseract_cmd: str | None = None) -> RobbieWindowsACI:
     )
 
 
-def test_windows_aci_disables_local_env_and_linux_actions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_windows_aci_disables_local_env_code_agent_and_linux_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr("shutil.which", lambda _name: None)
     aci = _make_aci()
 
     assert aci.env is None
+    assert aci.code_agent is None
     assert aci.platform == "windows"
     assert aci.tesseract_status.available is False
     assert "call_code_agent" not in aci.allowed_action_methods
@@ -154,6 +166,9 @@ def test_windows_aci_disables_local_env_and_linux_actions(monkeypatch: pytest.Mo
     with pytest.raises(OcrUnavailableError):
         aci.highlight_text_span("hello", "world")
 
+    with pytest.raises(ValueError, match="flat list of strings"):
+        aci.save_to_knowledge([["nested"]])  # type: ignore[list-item]
+
 
 def test_windows_aci_coordinate_scaling_clamping_and_grounding_errors(
     monkeypatch: pytest.MonkeyPatch,
@@ -162,7 +177,6 @@ def test_windows_aci_coordinate_scaling_clamping_and_grounding_errors(
     aci = _make_aci()
     aci.assign_screenshot({"screenshot": b"fake-png"})
 
-    # Valid grounding response scaled from 1000x1000 -> 1920x1080
     monkeypatch.setattr("robbie.agents.windows_aci.call_llm_safe", lambda _m: "(500, 250)")
     action = aci.click("The submit button", num_clicks=2, button_type="left")
     assert isinstance(action, ClickAction)
@@ -170,14 +184,12 @@ def test_windows_aci_coordinate_scaling_clamping_and_grounding_errors(
     assert action.y == 270
     assert action.num_clicks == 2
 
-    # Out-of-range coordinates clamp safely within primary monitor bounds
     monkeypatch.setattr("robbie.agents.windows_aci.call_llm_safe", lambda _m: "(5000, 5000)")
     clamped = aci.click("Far edge")
     assert isinstance(clamped, ClickAction)
     assert clamped.x == 1919
     assert clamped.y == 1079
 
-    # Malformed grounding output raises typed GroundingError instead of AssertionError
     monkeypatch.setattr("robbie.agents.windows_aci.call_llm_safe", lambda _m: "no coords here")
     with pytest.raises(GroundingError):
         aci.click("Missing button")
@@ -217,6 +229,7 @@ def test_windows_window_manager_matching() -> None:
 def test_windows_dispatcher_executes_actions_safely_with_mocks() -> None:
     driver = FakeInputDriver()
     clipboard = FakeClipboard(initial="keep-me")
+    launcher = FakeAppLauncher()
     wm = FakeWindowManager(
         [
             WindowEntry(
@@ -233,9 +246,9 @@ def test_windows_dispatcher_executes_actions_safely_with_mocks() -> None:
         input_driver=driver,
         window_manager=wm,
         clipboard=clipboard,
+        app_launcher=launcher,
     )
 
-    # Click
     res_click = dispatcher.execute(
         ClickAction(x=100, y=200, hold_keys=["shift"], element_description="Item")
     )
@@ -246,7 +259,6 @@ def test_windows_dispatcher_executes_actions_safely_with_mocks() -> None:
         ("key_up", "shift"),
     ]
 
-    # Unicode typing uses native Windows clipboard and restores prior content
     driver.calls.clear()
     res_unicode = dispatcher.execute(
         TypeTextAction(text="Olá Robbie 🤖", x=50, y=60, overwrite=True, enter=True)
@@ -257,41 +269,44 @@ def test_windows_dispatcher_executes_actions_safely_with_mocks() -> None:
     assert ("hotkey", ("ctrl", "v")) in driver.calls
     assert ("press", "enter") in driver.calls
 
-    # Native Windows application switching (no win+d, no wmctrl)
     res_switch = dispatcher.execute(SwitchApplicationAction(app_name="Calculator"))
     assert res_switch.status == "ok"
     assert wm.activated == ["Calculator"]
 
-    # Scroll, Hotkey, Open, Wait
     assert (
         dispatcher.execute(ScrollAction(x=300, y=300, clicks=-3, element_description="List")).status
         == "ok"
     )
     assert dispatcher.execute(HotkeyAction(keys=["ctrl", "c"])).status == "ok"
-    assert dispatcher.execute(OpenApplicationAction(target="Notepad")).status == "ok"
-    assert dispatcher.execute(WaitAction(seconds=0.5)).status == "ok"
 
-    # Out-of-bounds coordinates rejected
+    # Controlled WindowsAppLauncher is used (never Win-key Start-search typing!)
+    driver.calls.clear()
+    assert dispatcher.execute(OpenApplicationAction(target="Notepad")).status == "ok"
+    assert launcher.launched == [("Notepad", "application")]
+    assert driver.calls == []
+
+    assert dispatcher.execute(WaitAction(seconds=0.05)).status == "ok"
+
     with pytest.raises(ActionExecutionError, match="outside primary monitor bounds"):
         dispatcher.execute(ClickAction(x=3000, y=50, element_description="Second monitor"))
 
-    # UAC/UIPI permission boundary propagates WindowsPermissionError
     uac_dispatcher = WindowsActionDispatcher(
         display_info=_sample_display(),
         input_driver=driver,
         window_manager=FakeWindowManager([], deny_uac=True),
         clipboard=clipboard,
+        app_launcher=launcher,
     )
     with pytest.raises(WindowsPermissionError):
         uac_dispatcher.execute(SwitchApplicationAction(app_name="ElevatedApp"))
 
-    # Dry-run skips OS calls
     driver.calls.clear()
     dry_dispatcher = WindowsActionDispatcher(
         display_info=_sample_display(),
         input_driver=driver,
         window_manager=wm,
         clipboard=clipboard,
+        app_launcher=launcher,
         dry_run=True,
     )
     dry_res = dry_dispatcher.execute(ClickAction(x=10, y=10, element_description="Button"))

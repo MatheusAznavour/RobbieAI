@@ -1,8 +1,7 @@
-"""Isolated Agent-S S3 adapter with AST-only action parsing (zero eval/exec)."""
+"""Fail-closed Agent-S S3 adapter with AST-only action parsing (zero eval/exec)."""
 
 from __future__ import annotations
 
-import inspect
 import logging
 import re
 from collections.abc import Callable
@@ -59,13 +58,18 @@ class SafeRobbieWorker(Worker):
     Upstream `Worker.generate_next_action` calls `common_utils.create_pyautogui_code`
     which executes raw `eval(code)` twice (once in `CODE_VALID_FORMATTER` and again
     when building the action). `SafeRobbieWorker` replaces both with strict AST
-    validation (`parse_agent_call_ast`) and direct invocation of allowlisted
-    `RobbieWindowsACI` methods returning typed `RobbieAction` models.
+    validation (`parse_agent_call_ast` with signature binding) and direct invocation
+    of allowlisted `RobbieWindowsACI` methods returning typed `RobbieAction` models.
     """
 
     grounding_agent: RobbieWindowsACI
 
     def reset(self) -> None:
+        if not isinstance(self.grounding_agent, RobbieWindowsACI):
+            raise UnsafeActionCodeError(
+                "SafeRobbieWorker requires a RobbieWindowsACI grounding agent."
+            )
+
         skipped_actions = ["set_cell_values", "call_code_agent"]
         if not self.grounding_agent.tesseract_status.available:
             skipped_actions.append("highlight_text_span")
@@ -91,11 +95,13 @@ class SafeRobbieWorker(Worker):
         if not code:
             return False, "Incorrect code: Response must contain one Python code block."
         try:
-            parsed = parse_agent_call_ast(code, self.grounding_agent.allowed_action_methods)
-            method = getattr(self.grounding_agent, parsed.method_name)
-            inspect.signature(method).bind(*parsed.args, **parsed.kwargs)
+            parse_agent_call_ast(
+                code,
+                self.grounding_agent.allowed_action_methods,
+                method_signatures=self.grounding_agent.allowed_method_signatures,
+            )
             return True, ""
-        except (UnsafeActionCodeError, TypeError, AttributeError) as exc:
+        except UnsafeActionCodeError as exc:
             return (
                 False,
                 "Incorrect code: Action must be a single valid allowlisted method call "
@@ -109,6 +115,11 @@ class SafeRobbieWorker(Worker):
         *,
         cancel_check: Callable[[], bool] | None = None,
     ) -> tuple[dict[str, Any], list[RobbieAction]]:
+        if not isinstance(self.grounding_agent, RobbieWindowsACI):
+            raise UnsafeActionCodeError(
+                "SafeRobbieWorker requires a RobbieWindowsACI grounding agent."
+            )
+
         self.grounding_agent.assign_screenshot(obs)
         self.grounding_agent.set_task_instruction(instruction)
 
@@ -166,7 +177,11 @@ class SafeRobbieWorker(Worker):
         self.generator_agent.add_message(plan, role="assistant")
 
         plan_code = parse_code_from_string(plan)
-        parsed = parse_agent_call_ast(plan_code, self.grounding_agent.allowed_action_methods)
+        parsed = parse_agent_call_ast(
+            plan_code,
+            self.grounding_agent.allowed_action_methods,
+            method_signatures=self.grounding_agent.allowed_method_signatures,
+        )
         action_method = getattr(self.grounding_agent, parsed.method_name)
         action: RobbieAction = action_method(*parsed.args, **parsed.kwargs)
 
@@ -187,6 +202,8 @@ class RobbieAgentS3(AgentS3):
     """Subclass of AgentS3 wiring SafeRobbieWorker without modifying vendor/Agent-S."""
 
     def reset(self) -> None:
+        if not isinstance(self.grounding_agent, RobbieWindowsACI):
+            raise UnsafeActionCodeError("RobbieAgentS3 requires a RobbieWindowsACI instance.")
         self.executor = SafeRobbieWorker(
             worker_engine_params=self.worker_engine_params,
             grounding_agent=self.grounding_agent,
@@ -197,7 +214,7 @@ class RobbieAgentS3(AgentS3):
 
 
 class AgentS3Adapter:
-    """Facade isolating Robbie's backend and runner from Agent-S S3 internals."""
+    """Fail-closed facade isolating Robbie from Agent-S S3 internals."""
 
     def __init__(
         self,
@@ -208,6 +225,15 @@ class AgentS3Adapter:
         aci: RobbieWindowsACI | None = None,
         agent: RobbieAgentS3 | None = None,
     ) -> None:
+        if aci is not None and not isinstance(aci, RobbieWindowsACI):
+            raise UnsafeActionCodeError(
+                f"AgentS3Adapter requires RobbieWindowsACI; got {type(aci).__name__}."
+            )
+        if agent is not None and not isinstance(agent, RobbieAgentS3):
+            raise UnsafeActionCodeError(
+                f"AgentS3Adapter requires RobbieAgentS3; got {type(agent).__name__}."
+            )
+
         self.config = config
         self.display_info = display_info or get_windows_display_info()
 
@@ -227,10 +253,33 @@ class AgentS3Adapter:
             max_trajectory_length=config.max_trajectory_length,
             enable_reflection=config.enable_reflection,
         )
+        self._assert_safe_runtime()
+
+    def _assert_safe_runtime(self) -> SafeRobbieWorker:
+        if not isinstance(self.aci, RobbieWindowsACI):
+            raise UnsafeActionCodeError(
+                f"Unsafe ACI type '{type(self.aci).__name__}'; refusing execution."
+            )
+        if self.aci.env is not None or getattr(self.aci, "code_agent", None) is not None:
+            raise UnsafeActionCodeError(
+                "LocalEnv / CodeAgent must remain disabled on RobbieWindowsACI."
+            )
+        if not isinstance(self.agent, RobbieAgentS3):
+            raise UnsafeActionCodeError(
+                f"Unsafe agent type '{type(self.agent).__name__}'; refusing execution."
+            )
+        executor = getattr(self.agent, "executor", None)
+        if not isinstance(executor, SafeRobbieWorker):
+            raise UnsafeActionCodeError(
+                f"Unsafe worker type '{type(executor).__name__}'; "
+                "refusing fallback to upstream Agent-S Worker."
+            )
+        return executor
 
     def reset(self) -> None:
         self.aci.notes.clear()
         self.agent.reset()
+        self._assert_safe_runtime()
 
     def predict_step(
         self,
@@ -239,18 +288,17 @@ class AgentS3Adapter:
         *,
         cancel_check: Callable[[], bool] | None = None,
     ) -> StepPrediction:
-        """Run one synchronous Agent-S S3 prediction step (call off the asyncio loop)."""
+        """Run one synchronous Agent-S S3 prediction step (never falls back to upstream eval)."""
+        executor = self._assert_safe_runtime()
         obs = {"screenshot": screenshot_png}
-        executor = self.agent.executor
-        if isinstance(executor, SafeRobbieWorker):
-            info, actions = executor.generate_next_action(
-                instruction=instruction,
-                obs=obs,
-                cancel_check=cancel_check,
-            )
-        else:
-            info, actions = self.agent.predict(instruction=instruction, observation=obs)
+        info, actions = executor.generate_next_action(
+            instruction=instruction,
+            obs=obs,
+            cancel_check=cancel_check,
+        )
 
+        if not actions:
+            raise UnsafeActionCodeError("Adapter produced no action.")
         action = actions[0]
         if not isinstance(action, ROBBIE_ACTION_TYPES):
             raise UnsafeActionCodeError(

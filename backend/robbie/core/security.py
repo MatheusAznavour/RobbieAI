@@ -1,57 +1,133 @@
-"""Authentication, origin validation, and token-redacting logging utilities."""
+"""Authentication, origin validation, and comprehensive secret redaction utilities."""
 
 from __future__ import annotations
 
 import logging
+import re
 import secrets
-from typing import Final
+import threading
+from typing import Any, Final
 
 from fastapi import HTTPException, Request, WebSocket, status
 
 BEARER_PREFIX: Final[str] = "Bearer "
 REDACTED_MARKER: Final[str] = "[REDACTED]"
 
+CREDENTIAL_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
+    # OpenAI / Anthropic / Stripe-style secret keys
+    re.compile(r"\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_\-]{8,}\b"),
+    # GitHub classic & fine-grained PATs
+    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,})\b"),
+    # Google API keys
+    re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}\b"),
+    # Hugging Face access tokens
+    re.compile(r"\bhf_[A-Za-z0-9]{10,}\b"),
+    # AWS access key IDs
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    # Authorization Bearer tokens in logs or error strings
+    re.compile(r"\bBearer\s+[A-Za-z0-9._\-+/=]{8,}"),
+    # Credit card numbers (13-19 digits grouped by spaces or dashes)
+    re.compile(r"(?<!\d)(?:\d{4}[ -]){3}\d{1,7}(?!\d)"),
+    re.compile(r"(?<!\d)\d{13,19}(?!\d)"),
+)
+
+
+class SecretScrubber:
+    """Thread-safe secret registry and pattern scrubber for logs, errors, and events."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._secrets: set[str] = set()
+
+    def register(self, secret: str | None) -> None:
+        """Register a runtime secret so it is scrubbed from all output."""
+        if not secret:
+            return
+        cleaned = secret.strip()
+        if len(cleaned) < 6:
+            return
+        with self._lock:
+            self._secrets.add(cleaned)
+
+    def scrub_text(self, text: str) -> str:
+        """Remove registered secrets and recognizable credential patterns from text."""
+        if not text:
+            return text
+
+        scrubbed = text
+        with self._lock:
+            # Replace longer secrets first to avoid partial overlap leftovers.
+            registered = sorted(self._secrets, key=len, reverse=True)
+
+        for secret in registered:
+            if secret in scrubbed:
+                scrubbed = scrubbed.replace(secret, REDACTED_MARKER)
+
+        for pattern in CREDENTIAL_PATTERNS:
+            scrubbed = pattern.sub(REDACTED_MARKER, scrubbed)
+
+        return scrubbed
+
+    def scrub_value(self, value: Any) -> Any:
+        """Recursively scrub strings inside dicts, lists, and tuples."""
+        if isinstance(value, str):
+            return self.scrub_text(value)
+        if isinstance(value, dict):
+            return {k: self.scrub_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self.scrub_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.scrub_value(item) for item in value)
+        return value
+
+
+_GLOBAL_SCRUBBER = SecretScrubber()
+
+
+def get_secret_scrubber() -> SecretScrubber:
+    """Return the process-wide secret scrubber shared across logging and task events."""
+    return _GLOBAL_SCRUBBER
+
 
 class TokenRedactingFilter(logging.Filter):
-    """Logging filter that scrubs the active API bearer token from log output."""
+    """Logging filter that scrubs registered secrets and credential patterns from log records."""
 
-    def __init__(self, secret_token: str) -> None:
+    def __init__(self, secret_token: str | None = None, scrubber: SecretScrubber | None = None):
         super().__init__()
-        self._secret_token = secret_token
+        self._scrubber = scrubber or get_secret_scrubber()
+        if secret_token:
+            self._scrubber.register(secret_token)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if not self._secret_token:
-            return True
-
-        if isinstance(record.msg, str) and self._secret_token in record.msg:
-            record.msg = record.msg.replace(self._secret_token, REDACTED_MARKER)
+        if isinstance(record.msg, str):
+            record.msg = self._scrubber.scrub_text(record.msg)
 
         if record.args:
             if isinstance(record.args, tuple):
                 record.args = tuple(
-                    arg.replace(self._secret_token, REDACTED_MARKER)
-                    if isinstance(arg, str) and self._secret_token in arg
-                    else arg
+                    self._scrubber.scrub_text(arg) if isinstance(arg, str) else arg
                     for arg in record.args
                 )
             elif isinstance(record.args, dict):
                 record.args = {
-                    k: (
-                        v.replace(self._secret_token, REDACTED_MARKER)
-                        if isinstance(v, str) and self._secret_token in v
-                        else v
-                    )
+                    k: (self._scrubber.scrub_text(v) if isinstance(v, str) else v)
                     for k, v in record.args.items()
                 }
+
+        if record.exc_text:
+            record.exc_text = self._scrubber.scrub_text(record.exc_text)
         return True
 
 
 def configure_logging(log_level: str, secret_token: str) -> None:
-    """Configure structured stderr logging with bearer-token redaction."""
+    """Configure structured logging with comprehensive secret redaction."""
+    scrubber = get_secret_scrubber()
+    scrubber.register(secret_token)
+
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, log_level, logging.INFO))
 
-    redactor = TokenRedactingFilter(secret_token)
+    redactor = TokenRedactingFilter(secret_token=secret_token, scrubber=scrubber)
     for existing_filter in list(root_logger.filters):
         if isinstance(existing_filter, TokenRedactingFilter):
             root_logger.removeFilter(existing_filter)

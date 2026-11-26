@@ -1,5 +1,5 @@
 """Windows-native desktop primitives: DPI awareness, screen capture, window switching,
-clipboard handling, Tesseract detection, and validated action dispatch.
+controlled app launching, clipboard handling, Tesseract detection, and interruptible dispatch.
 """
 
 from __future__ import annotations
@@ -11,6 +11,8 @@ import logging
 import os
 import platform
 import shutil
+import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -33,12 +35,17 @@ from robbie.tools.actions import (
     TypeTextAction,
     WaitAction,
 )
+from robbie.tools.safety import classify_open_target
 
 logger = logging.getLogger("robbie.tools.windows")
 
 
 class ActionExecutionError(RuntimeError):
     """Raised when a validated desktop action fails during execution."""
+
+
+class ActionInterruptedError(ActionExecutionError):
+    """Raised when an action is aborted at a safe boundary by cancellation or emergency stop."""
 
 
 class WindowsPermissionError(ActionExecutionError):
@@ -86,7 +93,6 @@ def configure_windows_dpi_awareness() -> bool:
         shcore = ctypes.windll.shcore
         # PROCESS_PER_MONITOR_DPI_AWARE = 2
         result = shcore.SetProcessDpiAwareness(2)
-        # S_OK (0) or E_ACCESSDENIED (0x80070005 when already set)
         if result in (0, -2147024891):
             return True
     except Exception:
@@ -103,13 +109,13 @@ def get_windows_display_info(*, configure_dpi: bool = True) -> DisplayInfo:
     if platform.system() == "Windows":
         try:
             user32 = ctypes.windll.user32
-            primary_width = int(user32.GetSystemMetrics(0))  # SM_CXSCREEN
-            primary_height = int(user32.GetSystemMetrics(1))  # SM_CYSCREEN
-            virtual_left = int(user32.GetSystemMetrics(76))  # SM_XVIRTUALSCREEN
-            virtual_top = int(user32.GetSystemMetrics(77))  # SM_YVIRTUALSCREEN
-            virtual_width = int(user32.GetSystemMetrics(78))  # SM_CXVIRTUALSCREEN
-            virtual_height = int(user32.GetSystemMetrics(79))  # SM_CYVIRTUALSCREEN
-            monitor_count = int(user32.GetSystemMetrics(80))  # SM_CMONITORS
+            primary_width = int(user32.GetSystemMetrics(0))
+            primary_height = int(user32.GetSystemMetrics(1))
+            virtual_left = int(user32.GetSystemMetrics(76))
+            virtual_top = int(user32.GetSystemMetrics(77))
+            virtual_width = int(user32.GetSystemMetrics(78))
+            virtual_height = int(user32.GetSystemMetrics(79))
+            monitor_count = int(user32.GetSystemMetrics(80))
             return DisplayInfo(
                 primary_width=max(primary_width, 1),
                 primary_height=max(primary_height, 1),
@@ -236,7 +242,6 @@ class WindowsWindowManager:
         if not query or not windows:
             return None
 
-        # 1. Exact process stem or substring match against process name or title
         for win in windows:
             proc_stem = win.process_name.lower().removesuffix(".exe")
             if query == proc_stem or query == win.title.lower():
@@ -247,7 +252,6 @@ class WindowsWindowManager:
             if query in win.title.lower() or (proc_lower and query in proc_lower):
                 return win
 
-        # 2. Fuzzy match over combined title + process labels
         candidates = {f"{w.title} {w.process_name}".lower(): w for w in windows}
         close = difflib.get_close_matches(query, list(candidates.keys()), n=1, cutoff=0.35)
         if close:
@@ -284,6 +288,54 @@ class WindowsWindowManager:
             ) from exc
 
         return target
+
+
+class AppLauncherProtocol(Protocol):
+    def launch(self, target: str, target_kind: str = "application") -> str: ...
+
+
+class WindowsAppLauncher:
+    """Controlled Windows application/document launcher.
+
+    Never interprets targets as shell commands, never passes CLI arguments, and
+    never types arbitrary strings into Windows Start search.
+    """
+
+    def launch(self, target: str, target_kind: str = "application") -> str:
+        classification = classify_open_target(target)
+        if not classification.allowed:
+            raise ActionExecutionError(f"Blocked launch target '{target}': {classification.reason}")
+
+        if platform.system() != "Windows":
+            raise ActionExecutionError("WindowsAppLauncher is only supported on Windows.")
+
+        # 1. Explicitly allowlisted Windows binaries launched directly without shell.
+        if classification.resolved_executable:
+            resolved = shutil.which(classification.resolved_executable)
+            if not resolved:
+                raise ActionExecutionError(
+                    f"Allowlisted Windows binary '{classification.resolved_executable}' not found."
+                )
+            subprocess.Popen([resolved], shell=False)
+            return f"Launched allowlisted application '{classification.resolved_executable}'."
+
+        # 2. User-approved safe document file opened via OS file association (no shell).
+        expanded = os.path.abspath(os.path.expanduser(target))
+        if target_kind == "file" or os.path.isfile(expanded):
+            if not os.path.isfile(expanded):
+                raise ActionExecutionError(f"Approved file target does not exist: '{target}'.")
+            os.startfile(expanded)  # type: ignore[attr-defined]
+            return f"Opened approved document '{os.path.basename(expanded)}'."
+
+        # 3. User-approved non-allowlisted application resolved strictly via PATH (no args).
+        resolved_app = shutil.which(target)
+        if resolved_app:
+            subprocess.Popen([resolved_app], shell=False)
+            return f"Launched approved application '{os.path.basename(resolved_app)}'."
+
+        raise ActionExecutionError(
+            f"Could not safely resolve application or document target '{target}'."
+        )
 
 
 class ClipboardProtocol(Protocol):
@@ -376,7 +428,7 @@ class ActionExecutionResult:
 
 
 class WindowsActionDispatcher:
-    """Executes strictly validated RobbieAction objects without `exec()` or shell strings."""
+    """Executes strictly validated RobbieAction objects with cooperative stop interruption."""
 
     def __init__(
         self,
@@ -385,12 +437,14 @@ class WindowsActionDispatcher:
         input_driver: InputDriverProtocol | None = None,
         window_manager: WindowManagerProtocol | None = None,
         clipboard: ClipboardProtocol | None = None,
+        app_launcher: AppLauncherProtocol | None = None,
         dry_run: bool = False,
     ) -> None:
         self.display_info = display_info or get_windows_display_info()
         self._input_driver = input_driver
         self.window_manager: WindowManagerProtocol = window_manager or WindowsWindowManager()
         self.clipboard: ClipboardProtocol = clipboard or WindowsClipboard()
+        self.app_launcher: AppLauncherProtocol = app_launcher or WindowsAppLauncher()
         self.dry_run = dry_run
 
     @property
@@ -398,6 +452,25 @@ class WindowsActionDispatcher:
         if self._input_driver is None:
             self._input_driver = PyAutoGuiInputDriver()
         return self._input_driver
+
+    @staticmethod
+    def _check_stop(stop_event: threading.Event | None) -> None:
+        if stop_event is not None and stop_event.is_set():
+            raise ActionInterruptedError("Action aborted by cancellation or emergency stop.")
+
+    def _interruptible_sleep(
+        self,
+        seconds: float,
+        stop_event: threading.Event | None,
+    ) -> None:
+        if seconds <= 0:
+            self._check_stop(stop_event)
+            return
+        if stop_event is None:
+            self.input_driver.sleep(seconds)
+            return
+        if stop_event.wait(timeout=seconds):
+            raise ActionInterruptedError("Wait aborted by cancellation or emergency stop.")
 
     def _validate_point(self, x: int, y: int) -> tuple[int, int]:
         max_x = self.display_info.primary_width - 1
@@ -409,7 +482,14 @@ class WindowsActionDispatcher:
             )
         return x, y
 
-    def execute(self, action: RobbieAction) -> ActionExecutionResult:
+    def execute(
+        self,
+        action: RobbieAction,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> ActionExecutionResult:
+        self._check_stop(stop_event)
+
         if isinstance(action, (DoneAction, FailAction, SaveToKnowledgeAction)):
             return ActionExecutionResult(
                 kind=action.kind,
@@ -428,6 +508,7 @@ class WindowsActionDispatcher:
             x, y = self._validate_point(action.x, action.y)
             self._with_held_keys(
                 action.hold_keys,
+                stop_event,
                 lambda: self.input_driver.click(x, y, action.num_clicks, action.button),
             )
             return ActionExecutionResult(
@@ -439,10 +520,16 @@ class WindowsActionDispatcher:
         if isinstance(action, TypeTextAction):
             if action.x is not None and action.y is not None:
                 x, y = self._validate_point(action.x, action.y)
+                self._check_stop(stop_event)
                 self.input_driver.click(x, y, 1, "left")
+
             if action.overwrite:
+                self._check_stop(stop_event)
                 self.input_driver.hotkey("ctrl", "a")
+                self._check_stop(stop_event)
                 self.input_driver.press("backspace")
+
+            self._check_stop(stop_event)
             has_non_ascii = any(ord(ch) > 127 for ch in action.text)
             if has_non_ascii:
                 previous_clipboard: str | None = None
@@ -450,18 +537,25 @@ class WindowsActionDispatcher:
                     previous_clipboard = self.clipboard.get_text()
                 except Exception:
                     previous_clipboard = None
-                self.clipboard.set_text(action.text)
-                self.input_driver.hotkey("ctrl", "v")
-                if previous_clipboard is not None:
-                    self.input_driver.sleep(0.05)
-                    try:
-                        self.clipboard.set_text(previous_clipboard)
-                    except Exception:
-                        pass
+                try:
+                    self._check_stop(stop_event)
+                    self.clipboard.set_text(action.text)
+                    self._check_stop(stop_event)
+                    self.input_driver.hotkey("ctrl", "v")
+                    self._interruptible_sleep(0.05, stop_event)
+                finally:
+                    if previous_clipboard is not None:
+                        try:
+                            self.clipboard.set_text(previous_clipboard)
+                        except Exception:
+                            pass
             else:
                 self.input_driver.write_ascii(action.text)
+
             if action.enter:
+                self._check_stop(stop_event)
                 self.input_driver.press("enter")
+
             return ActionExecutionResult(
                 kind=action.kind,
                 status="ok",
@@ -471,13 +565,12 @@ class WindowsActionDispatcher:
         if isinstance(action, DragAndDropAction):
             sx, sy = self._validate_point(action.start_x, action.start_y)
             ex, ey = self._validate_point(action.end_x, action.end_y)
+            self._check_stop(stop_event)
             self.input_driver.move_to(sx, sy)
             self._with_held_keys(
                 action.hold_keys,
-                lambda: (
-                    self.input_driver.drag_to(ex, ey, 0.6, "left"),
-                    self.input_driver.mouse_up(),
-                ),
+                stop_event,
+                lambda: self._perform_drag(sx, sy, ex, ey, "left", stop_event),
             )
             return ActionExecutionResult(
                 kind=action.kind,
@@ -488,9 +581,9 @@ class WindowsActionDispatcher:
         if isinstance(action, HighlightTextSpanAction):
             sx, sy = self._validate_point(action.start_x, action.start_y)
             ex, ey = self._validate_point(action.end_x, action.end_y)
+            self._check_stop(stop_event)
             self.input_driver.move_to(sx, sy)
-            self.input_driver.drag_to(ex, ey, 0.6, action.button)
-            self.input_driver.mouse_up()
+            self._perform_drag(sx, sy, ex, ey, action.button, stop_event)
             return ActionExecutionResult(
                 kind=action.kind,
                 status="ok",
@@ -499,7 +592,9 @@ class WindowsActionDispatcher:
 
         if isinstance(action, ScrollAction):
             x, y = self._validate_point(action.x, action.y)
+            self._check_stop(stop_event)
             self.input_driver.move_to(x, y)
+            self._check_stop(stop_event)
             if action.horizontal:
                 self.input_driver.hscroll(action.clicks)
             else:
@@ -511,6 +606,7 @@ class WindowsActionDispatcher:
             )
 
         if isinstance(action, HotkeyAction):
+            self._check_stop(stop_event)
             self.input_driver.hotkey(*action.keys)
             return ActionExecutionResult(
                 kind=action.kind,
@@ -521,7 +617,8 @@ class WindowsActionDispatcher:
         if isinstance(action, HoldAndPressAction):
             self._with_held_keys(
                 action.hold_keys,
-                lambda: self.input_driver.press(action.press_keys),
+                stop_event,
+                lambda: self._press_sequence(action.press_keys, stop_event),
             )
             return ActionExecutionResult(
                 kind=action.kind,
@@ -530,6 +627,7 @@ class WindowsActionDispatcher:
             )
 
         if isinstance(action, SwitchApplicationAction):
+            self._check_stop(stop_event)
             matched = self.window_manager.activate_application(action.app_name)
             return ActionExecutionResult(
                 kind=action.kind,
@@ -538,21 +636,16 @@ class WindowsActionDispatcher:
             )
 
         if isinstance(action, OpenApplicationAction):
-            # Use Windows Start search UI instead of shell execution so no shell
-            # interpolation or arbitrary command execution is introduced.
-            self.input_driver.press("win")
-            self.input_driver.sleep(0.4)
-            self.input_driver.write_ascii(action.target)
-            self.input_driver.sleep(0.8)
-            self.input_driver.press("enter")
+            self._check_stop(stop_event)
+            detail = self.app_launcher.launch(action.target, action.target_kind)
             return ActionExecutionResult(
                 kind=action.kind,
                 status="ok",
-                detail=f"Requested opening '{action.target}' via Windows Start.",
+                detail=detail,
             )
 
         if isinstance(action, WaitAction):
-            self.input_driver.sleep(action.seconds)
+            self._interruptible_sleep(action.seconds, stop_event)
             return ActionExecutionResult(
                 kind=action.kind,
                 status="ok",
@@ -561,12 +654,46 @@ class WindowsActionDispatcher:
 
         raise ActionExecutionError(f"Unsupported action type: {type(action).__name__}")
 
-    def _with_held_keys(self, hold_keys: list[str], operation: Any) -> None:
+    def _perform_drag(
+        self,
+        _sx: int,
+        _sy: int,
+        ex: int,
+        ey: int,
+        button: str,
+        stop_event: threading.Event | None,
+    ) -> None:
+        self._check_stop(stop_event)
+        try:
+            self.input_driver.drag_to(ex, ey, 0.3, button)
+        finally:
+            try:
+                self.input_driver.mouse_up()
+            except Exception:
+                pass
+
+    def _press_sequence(
+        self,
+        press_keys: list[str],
+        stop_event: threading.Event | None,
+    ) -> None:
+        for key in press_keys:
+            self._check_stop(stop_event)
+            self.input_driver.press(key)
+
+    def _with_held_keys(
+        self,
+        hold_keys: list[str],
+        stop_event: threading.Event | None,
+        operation: Any,
+    ) -> None:
         pressed: list[str] = []
         try:
             for key in hold_keys:
+                self._check_stop(stop_event)
                 self.input_driver.key_down(key)
                 pressed.append(key)
+            self._check_stop(stop_event)
             operation()
         finally:
             for key in reversed(pressed):
